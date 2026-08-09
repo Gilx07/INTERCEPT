@@ -24,103 +24,66 @@ DWORD WINAPI worker_thread(LPVOID)
     intercept::log::init();
     intercept::console::init();
 
-    intercept::log::info(
-        "========================================"
-    );
+    intercept::log::info("========================================");
+    intercept::log::info("INTERCEPT v0.2 starting");
+    intercept::log::info("Target: GTA SA 1.0 US / SA-MP 0.3.DL-R1");
+    intercept::log::info("Mode: realtime packet/RPC monitor");
+    intercept::log::info("========================================");
 
-    intercept::log::info(
-        "INTERCEPT v0.2 starting"
-    );
-
-    intercept::log::info(
-        "Target: GTA SA 1.0 US / SA-MP 0.3.DL-R1"
-    );
-
-    intercept::log::info(
-        "Mode: realtime packet/RPC monitor"
-    );
-
-    intercept::log::info(
-        "========================================"
-    );
-
-    intercept::console::print(
-        "[INIT] Waiting for samp.dll..."
-    );
+    intercept::console::print("[INIT] Waiting for samp.dll...");
 
     while (!g_stop.load())
     {
         if (GetModuleHandleA("samp.dll"))
             break;
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(250)
-        );
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 
     if (g_stop.load())
     {
-        intercept::log::info(
-            "Startup cancelled."
-        );
-
+        intercept::log::info("Startup cancelled.");
         intercept::console::shutdown();
         intercept::log::shutdown();
-
         return 0;
     }
 
-    intercept::log::info(
-        "samp.dll detected."
-    );
-
-    intercept::console::print(
-        "[INIT] samp.dll detected."
-    );
-
-    intercept::monitor::install();
+    intercept::log::info("samp.dll detected.");
+    intercept::console::print("[INIT] samp.dll detected.");
 
     bool initialized = false;
 
-    for (
-        int attempt = 1;
-        attempt <= 120 && !g_stop.load();
-        ++attempt)
+    for (int attempt = 1; attempt <= 120 && !g_stop.load(); ++attempt)
     {
+        intercept::log::info(
+            "Trying RakHook initialization. attempt=" +
+            std::to_string(attempt)
+        );
+
         if (rakhook::initialize())
         {
             initialized = true;
 
             std::ostringstream ss;
-
             ss << "RakHook initialized. attempt="
                << attempt
                << " samp_version="
-               << static_cast<int>(
-                    rakhook::samp_version()
-                  );
+               << static_cast<int>(rakhook::samp_version());
 
-            intercept::log::info(
-                ss.str()
-            );
+            intercept::log::info(ss.str());
+            intercept::console::print("[INIT] " + ss.str());
 
-            intercept::console::print(
-                "[INIT] " + ss.str()
-            );
+            // RakHook MUST be initialized before registering monitor callbacks.
+            intercept::monitor::install();
 
-            intercept::log::info(
-                "Realtime monitor is active."
-            );
+            intercept::log::info("Monitor callbacks registered after RakHook initialization.");
+            intercept::console::print("[HOOK] Monitor callbacks registered.");
 
-            intercept::console::print(
-                "[READY] Realtime monitor is active."
-            );
+            intercept::log::info("Realtime monitor is active.");
+            intercept::console::print("[READY] Realtime monitor is active.");
 
             intercept::gui::start();
-
-            intercept::console::print(
-                "[GUI] Realtime monitor GUI started."
-            );
+            intercept::console::print("[GUI] Realtime monitor GUI started.");
 
             break;
         }
@@ -128,8 +91,7 @@ DWORD WINAPI worker_thread(LPVOID)
         if (attempt == 120)
         {
             intercept::log::error(
-                "RakHook initialization failed "
-                "after 120 attempts."
+                "RakHook initialization failed after 120 attempts."
             );
 
             intercept::console::print(
@@ -137,38 +99,24 @@ DWORD WINAPI worker_thread(LPVOID)
             );
         }
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(250)
-        );
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 
     while (!g_stop.load())
     {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(500)
-        );
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     intercept::gui::stop();
 
-    if (
-        initialized &&
-        rakhook::initialized)
+    if (initialized && rakhook::initialized)
     {
-        intercept::log::info(
-            "Destroying RakHook."
-        );
-
+        intercept::log::info("Destroying RakHook.");
         rakhook::destroy();
     }
 
-    intercept::log::info(
-        "INTERCEPT stopped."
-    );
-
-    intercept::console::print(
-        "[STOP] INTERCEPT stopped."
-    );
+    intercept::log::info("INTERCEPT stopped.");
+    intercept::console::print("[STOP] INTERCEPT stopped.");
 
     intercept::console::shutdown();
     intercept::log::shutdown();
@@ -187,21 +135,17 @@ BOOL APIENTRY DllMain(
     {
         g_module = hModule;
 
-        DisableThreadLibraryCalls(
-            hModule
-        );
-
+        DisableThreadLibraryCalls(hModule);
         g_stop = false;
 
-        g_thread =
-            CreateThread(
-                nullptr,
-                0,
-                worker_thread,
-                nullptr,
-                0,
-                nullptr
-            );
+        g_thread = CreateThread(
+            nullptr,
+            0,
+            worker_thread,
+            nullptr,
+            0,
+            nullptr
+        );
 
         return g_thread != nullptr;
     }
