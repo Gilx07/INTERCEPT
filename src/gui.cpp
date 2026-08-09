@@ -85,12 +85,37 @@ int g_type_tab = 0;
 int g_dir_tab = 0;
 std::deque<EventRecord> g_records[2][2];
 
+constexpr COLORREF C_BG = RGB(24, 24, 28);
+constexpr COLORREF C_PANEL = RGB(31, 31, 36);
+constexpr COLORREF C_INPUT = RGB(39, 39, 46);
+constexpr COLORREF C_BORDER = RGB(62, 62, 72);
+constexpr COLORREF C_TEXT = RGB(232, 232, 238);
+constexpr COLORREF C_MUTED = RGB(165, 165, 178);
+constexpr COLORREF C_GRID = RGB(52, 52, 60);
+constexpr COLORREF C_IN = RGB(45, 160, 90);
+constexpr COLORREF C_OUT = RGB(205, 65, 65);
+constexpr COLORREF C_PACKET = RGB(55, 125, 220);
+constexpr COLORREF C_RPC = RGB(135, 75, 190);
+
 LRESULT CALLBACK wnd_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK detail_proc(HWND, UINT, WPARAM, LPARAM);
 
 int type_index(EventType type) { return type == EventType::Packet ? 0 : 1; }
 int dir_index(Direction dir) { return dir == Direction::Incoming ? 0 : 1; }
 HWND current_list() { return g_lists[g_type_tab][g_dir_tab]; }
+
+void apply_dark_theme(HWND hwnd)
+{
+    if (!hwnd) return;
+    SetWindowTheme(hwnd, L"", L"");
+    SetClassLongPtrA(hwnd, GCLP_HBRBACKGROUND, reinterpret_cast<LONG_PTR>(CreateSolidBrush(C_BG)));
+}
+
+void apply_dark_control(HWND hwnd)
+{
+    if (!hwnd) return;
+    SetWindowTheme(hwnd, L"", L"");
+}
 
 bool matches_filter(const std::string& event)
 {
@@ -341,12 +366,14 @@ void send_detail(HWND hwnd, DetailState* state)
 
 void create_detail_controls(HWND hwnd, DetailState* state)
 {
+    apply_dark_theme(hwnd);
     const char* type = state->event.type == EventType::Packet ? "PACKET" : "RPC";
     const char* direction = state->event.direction == Direction::Incoming ? "IN" : "OUT";
 
     auto static_text = [&](const char* text, int x, int y, int w, int h) {
         HWND control = CreateWindowExA(0, "STATIC", text, WS_CHILD | WS_VISIBLE,
             x, y, w, h, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+        apply_dark_control(control);
         SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     };
 
@@ -357,10 +384,11 @@ void create_detail_controls(HWND hwnd, DetailState* state)
 
     HWND label = CreateWindowExA(0, "STATIC", "HEX (editable):", WS_CHILD | WS_VISIBLE,
         15, 72, 150, 22, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    apply_dark_control(label);
     SendMessageA(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
     state->hex = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", state->event.hex.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_WANTRETURN | WS_VSCROLL,
         15, 98, 680, 300, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_HEX), GetModuleHandleA(nullptr), nullptr);
     SendMessageA(state->hex, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     SendMessageA(state->hex, EM_SETLIMITTEXT, 65535, 0);
@@ -371,6 +399,9 @@ void create_detail_controls(HWND hwnd, DetailState* state)
         135, 415, 100, 30, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_SEND), GetModuleHandleA(nullptr), nullptr);
     HWND close = CreateWindowExA(0, "BUTTON", "Close", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         595, 415, 100, 30, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_CLOSE), GetModuleHandleA(nullptr), nullptr);
+    apply_dark_control(copy);
+    apply_dark_control(send);
+    apply_dark_control(close);
     SendMessageA(copy, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     SendMessageA(send, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     SendMessageA(close, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
@@ -388,6 +419,39 @@ LRESULT CALLBACK detail_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
             create_detail_controls(hwnd, state);
             return 0;
+        }
+        case WM_CTLCOLOREDIT:
+        {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, C_TEXT);
+            SetBkColor(dc, C_INPUT);
+            static HBRUSH brush = CreateSolidBrush(C_INPUT);
+            return reinterpret_cast<LRESULT>(brush);
+        }
+        case WM_CTLCOLORSTATIC:
+        {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, C_TEXT);
+            SetBkColor(dc, C_BG);
+            static HBRUSH brush = CreateSolidBrush(C_BG);
+            return reinterpret_cast<LRESULT>(brush);
+        }
+        case WM_CTLCOLORBTN:
+        {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, C_TEXT);
+            SetBkColor(dc, C_PANEL);
+            static HBRUSH brush = CreateSolidBrush(C_PANEL);
+            return reinterpret_cast<LRESULT>(brush);
+        }
+        case WM_ERASEBKGND:
+        {
+            RECT rect{};
+            GetClientRect(hwnd, &rect);
+            HBRUSH brush = CreateSolidBrush(C_BG);
+            FillRect(reinterpret_cast<HDC>(wParam), &rect, brush);
+            DeleteObject(brush);
+            return 1;
         }
         case WM_COMMAND:
         {
@@ -436,7 +500,7 @@ void open_detail(const EventRecord& event)
         wc.hInstance = instance;
         wc.lpszClassName = class_name;
         wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
-        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.hbrBackground = CreateSolidBrush(C_BG);
         RegisterClassExA(&wc);
         registered = true;
     }
@@ -462,6 +526,8 @@ void create_tabs(HWND hwnd)
         WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED,
         270, 42, 250, 32, hwnd, reinterpret_cast<HMENU>(IDC_DIR_TABS), GetModuleHandleA(nullptr), nullptr);
 
+    apply_dark_control(g_type_tabs);
+    apply_dark_control(g_dir_tabs);
     SendMessageA(g_type_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     SendMessageA(g_dir_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
@@ -484,6 +550,7 @@ HWND create_list(HWND hwnd, int type, int direction)
         WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
         10, 78, 1000, 570, hwnd, reinterpret_cast<HMENU>(id), GetModuleHandleA(nullptr), nullptr);
     if (!list) return nullptr;
+    apply_dark_control(list);
     SendMessageA(list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     SendMessageA(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
         LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
@@ -497,19 +564,23 @@ void create_controls(HWND hwnd)
 
     g_filter = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
         10, 10, 300, 24, hwnd, reinterpret_cast<HMENU>(IDC_FILTER), GetModuleHandleA(nullptr), nullptr);
+    apply_dark_control(g_filter);
     SendMessageA(g_filter, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
     HWND label = CreateWindowExA(0, "STATIC", "Filter:", WS_CHILD | WS_VISIBLE,
         320, 13, 50, 20, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+    apply_dark_control(label);
     SendMessageA(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
     g_autoscroll = CreateWindowExA(0, "BUTTON", "Auto Scroll", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
         390, 10, 110, 24, hwnd, reinterpret_cast<HMENU>(IDC_AUTOSCROLL), GetModuleHandleA(nullptr), nullptr);
+    apply_dark_control(g_autoscroll);
     SendMessageA(g_autoscroll, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     SendMessageA(g_autoscroll, BM_SETCHECK, BST_CHECKED, 0);
 
     HWND clear = CreateWindowExA(0, "BUTTON", "Clear", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
         510, 10, 80, 24, hwnd, reinterpret_cast<HMENU>(IDC_CLEAR), GetModuleHandleA(nullptr), nullptr);
+    apply_dark_control(clear);
     SendMessageA(clear, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
     create_tabs(hwnd);
@@ -538,16 +609,16 @@ void draw_owner_tab(const DRAWITEMSTRUCT* dis)
 
     COLORREF color;
     if (type_tab)
-        color = tab_index == 0 ? RGB(55, 125, 220) : RGB(135, 75, 190);
+        color = tab_index == 0 ? C_PACKET : C_RPC;
     else
-        color = tab_index == 0 ? RGB(45, 160, 90) : RGB(205, 65, 65);
+        color = tab_index == 0 ? C_IN : C_OUT;
 
     if (!selected)
     {
         color = RGB(
-            (GetRValue(color) + 210) / 2,
-            (GetGValue(color) + 210) / 2,
-            (GetBValue(color) + 210) / 2);
+            (GetRValue(color) + 48) / 2,
+            (GetGValue(color) + 48) / 2,
+            (GetBValue(color) + 48) / 2);
     }
 
     HBRUSH brush = CreateSolidBrush(color);
@@ -566,11 +637,19 @@ void draw_owner_tab(const DRAWITEMSTRUCT* dis)
     DrawTextA(dis->hDC, text, -1, const_cast<RECT*>(&dis->rcItem), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+void draw_list_item(const NMLVCUSTOMDRAW* draw)
+{
+    if (!draw) return;
+    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
+        return;
+}
+
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
         case WM_CREATE:
+            apply_dark_theme(hwnd);
             create_controls(hwnd);
             SetTimer(hwnd, 1, 50, nullptr);
             return 0;
@@ -578,6 +657,43 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_DRAWITEM:
             draw_owner_tab(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
             return TRUE;
+
+        case WM_CTLCOLOREDIT:
+        {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, C_TEXT);
+            SetBkColor(dc, C_INPUT);
+            static HBRUSH brush = CreateSolidBrush(C_INPUT);
+            return reinterpret_cast<LRESULT>(brush);
+        }
+
+        case WM_CTLCOLORSTATIC:
+        {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, C_TEXT);
+            SetBkColor(dc, C_BG);
+            static HBRUSH brush = CreateSolidBrush(C_BG);
+            return reinterpret_cast<LRESULT>(brush);
+        }
+
+        case WM_CTLCOLORBTN:
+        {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetTextColor(dc, C_TEXT);
+            SetBkColor(dc, C_PANEL);
+            static HBRUSH brush = CreateSolidBrush(C_PANEL);
+            return reinterpret_cast<LRESULT>(brush);
+        }
+
+        case WM_ERASEBKGND:
+        {
+            RECT rect{};
+            GetClientRect(hwnd, &rect);
+            HBRUSH brush = CreateSolidBrush(C_BG);
+            FillRect(reinterpret_cast<HDC>(wParam), &rect, brush);
+            DeleteObject(brush);
+            return 1;
+        }
 
         case WM_TIMER:
             if (wParam == 1) flush_pending();
@@ -617,6 +733,25 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 }
                 return 0;
             }
+
+            if (header->code == NM_CUSTOMDRAW)
+            {
+                const auto* draw = reinterpret_cast<const NMLVCUSTOMDRAW*>(lParam);
+                if (header->idFrom >= IDC_LIST_BASE && header->idFrom < IDC_LIST_BASE + 4)
+                {
+                    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
+                        return CDRF_NOTIFYITEMDRAW;
+                    if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
+                    {
+                        const int list_id = static_cast<int>(header->idFrom);
+                        const int direction = (list_id - IDC_LIST_BASE) % 2;
+                        draw->clrText = direction == 0 ? C_TEXT : C_TEXT;
+                        draw->clrTextBk = C_PANEL;
+                        return CDRF_DODEFAULT;
+                    }
+                }
+            }
+
             return 0;
         }
 
@@ -681,7 +816,7 @@ void gui_thread_proc()
     wc.hInstance = instance;
     wc.lpszClassName = "INTERCEPT_GUI";
     wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    wc.hbrBackground = CreateSolidBrush(C_BG);
 
     if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
     {
