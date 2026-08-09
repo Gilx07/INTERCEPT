@@ -15,7 +15,7 @@
 
 namespace {
 std::atomic_bool g_installed{false};
-constexpr std::size_t MAX_HEX_DUMP = 256;
+constexpr std::size_t MAX_HEX_DUMP = 4096;
 
 const char* direction_name(intercept::events::Direction direction)
 {
@@ -133,25 +133,18 @@ bool parse_hex(const std::string& input, std::vector<unsigned char>& out)
 
     out.clear();
     int high = -1;
-
     for (char c : input)
     {
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
-            continue;
-
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
         const int nibble = value(c);
-        if (nibble < 0)
-            return false;
-
-        if (high < 0)
-            high = nibble;
+        if (nibble < 0) return false;
+        if (high < 0) high = nibble;
         else
         {
             out.push_back(static_cast<unsigned char>((high << 4) | nibble));
             high = -1;
         }
     }
-
     return high < 0 && !out.empty();
 }
 
@@ -215,21 +208,14 @@ bool send_packet_hex(const std::string& hex)
     }
 
     RakNet::BitStream bs(bytes.data(), static_cast<unsigned int>(bytes.size()), false);
-    const bool ok = rakhook::send(
-        &bs,
-        HIGH_PRIORITY,
-        RELIABLE_ORDERED,
-        0
-    );
-
+    const bool ok = rakhook::send(&bs, HIGH_PRIORITY, RELIABLE_ORDERED, 0);
     log::info(std::string("GUI send packet: ") + (ok ? "success" : "failed"));
     return ok;
 }
 
 bool send_rpc_hex(int id, const std::string& hex)
 {
-    if (id < 0 || id > 255)
-        return false;
+    if (id < 0 || id > 255) return false;
 
     std::vector<unsigned char> bytes;
     if (!parse_hex(hex, bytes))
@@ -239,15 +225,7 @@ bool send_rpc_hex(int id, const std::string& hex)
     }
 
     RakNet::BitStream bs(bytes.data(), static_cast<unsigned int>(bytes.size()), false);
-    const bool ok = rakhook::send_rpc(
-        id,
-        &bs,
-        HIGH_PRIORITY,
-        RELIABLE_ORDERED,
-        0,
-        false
-    );
-
+    const bool ok = rakhook::send_rpc(id, &bs, HIGH_PRIORITY, RELIABLE_ORDERED, 0, false);
     log::info(std::string("GUI send RPC: ") + (ok ? "success" : "failed"));
     return ok;
 }
