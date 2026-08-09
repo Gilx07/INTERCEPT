@@ -1,6 +1,7 @@
 #include "monitor.hpp"
 #include "decoder.hpp"
 #include "event_queue.hpp"
+#include "gui.hpp"
 #include "logger.hpp"
 
 #include <RakHook/rakhook.hpp>
@@ -13,6 +14,54 @@
 namespace {
 std::atomic_bool g_installed{false};
 constexpr std::size_t MAX_HEX_DUMP = 256;
+
+const char* direction_name(intercept::events::Direction direction)
+{
+    return direction == intercept::events::Direction::Incoming
+        ? "IN"
+        : "OUT";
+}
+
+void publish_gui(const intercept::events::Event& event)
+{
+    const char* type =
+        event.kind == intercept::events::Kind::Packet
+            ? "PACKET"
+            : "RPC";
+
+    std::string message;
+
+    message.reserve(
+        event.name.size() +
+        event.details.size() +
+        event.hex.size() +
+        64
+    );
+
+    message += type;
+    message += '|';
+    message += std::to_string(event.id);
+    message += '|';
+    message += std::to_string(event.bytes);
+    message += '|';
+    message += direction_name(event.direction);
+    message += '|';
+    message += event.name;
+
+    if (!event.details.empty())
+    {
+        message += " | ";
+        message += event.details;
+    }
+
+    if (!event.hex.empty())
+    {
+        message += " | HEX: ";
+        message += event.hex;
+    }
+
+    intercept::gui::push_event(message);
+}
 
 std::string packet_hex(RakNet::BitStream* bs)
 {
@@ -44,6 +93,8 @@ void push_packet(intercept::events::Direction direction, RakNet::BitStream* bs)
     e.details = decoded.details;
     e.id = (data && e.bytes) ? static_cast<unsigned char>(data[0]) : -1;
     e.hex = packet_hex(bs);
+
+    publish_gui(e);
     intercept::events::push(std::move(e));
 }
 
@@ -60,6 +111,8 @@ void push_packet(intercept::events::Direction direction, Packet* packet)
     e.details = decoded.details;
     e.id = (data && e.bytes) ? data[0] : -1;
     e.hex = packet_hex(packet);
+
+    publish_gui(e);
     intercept::events::push(std::move(e));
 }
 
@@ -75,6 +128,8 @@ void push_rpc(intercept::events::Direction direction, unsigned char id, RakNet::
     e.name = decoded.name;
     e.details = decoded.details;
     e.hex = packet_hex(bs);
+
+    publish_gui(e);
     intercept::events::push(std::move(e));
 }
 
