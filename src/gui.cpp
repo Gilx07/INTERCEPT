@@ -32,17 +32,25 @@ namespace {
 constexpr int IDC_FILTER     = 1001;
 constexpr int IDC_AUTOSCROLL = 1002;
 constexpr int IDC_CLEAR      = 1003;
-constexpr int IDC_LIST       = 1004;
+constexpr int IDC_TYPE_TABS  = 1004;
+constexpr int IDC_DIR_TABS   = 1005;
+constexpr int IDC_LIST_BASE  = 1100;
 
 constexpr UINT WM_INTERCEPT_EVENT = WM_APP + 1;
 
 constexpr size_t MAX_QUEUE_SIZE = 10000;
 constexpr size_t MAX_EVENTS_PER_TICK = 250;
 
+enum class EventType { Packet, Rpc };
+enum class Direction { Incoming, Outgoing };
+
 HWND g_hwnd = nullptr;
 HWND g_filter = nullptr;
-HWND g_list = nullptr;
 HWND g_autoscroll = nullptr;
+HWND g_type_tabs = nullptr;
+HWND g_dir_tabs = nullptr;
+
+HWND g_lists[2][2]{};
 
 HFONT g_font = nullptr;
 
@@ -59,6 +67,8 @@ std::atomic_bool g_ready{false};
 
 bool g_auto_scroll = true;
 std::string g_filter_text;
+int g_type_tab = 0;
+int g_dir_tab = 0;
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -93,9 +103,31 @@ bool matches_filter(const std::string& event)
     return lower.find(g_filter_text) != std::string::npos;
 }
 
-void add_column(int index, int width, const char* text)
+HWND current_list()
 {
-    if (!g_list) return;
+    return g_lists[g_type_tab][g_dir_tab];
+}
+
+void show_active_list()
+{
+    for (int type = 0; type < 2; ++type)
+    {
+        for (int dir = 0; dir < 2; ++dir)
+        {
+            if (g_lists[type][dir])
+            {
+                ShowWindow(
+                    g_lists[type][dir],
+                    type == g_type_tab && dir == g_dir_tab ? SW_SHOW : SW_HIDE
+                );
+            }
+        }
+    }
+}
+
+void add_column(HWND list, int index, int width, const char* text)
+{
+    if (!list) return;
 
     LVCOLUMNA column{};
     column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
@@ -104,25 +136,24 @@ void add_column(int index, int width, const char* text)
     column.iSubItem = index;
 
     SendMessageA(
-        g_list,
+        list,
         LVM_INSERTCOLUMNA,
         static_cast<WPARAM>(index),
         reinterpret_cast<LPARAM>(&column)
     );
 }
 
-void add_columns()
+void add_columns(HWND list)
 {
-    add_column(0, 100, "Type");
-    add_column(1, 100, "ID");
-    add_column(2, 80, "Size");
-    add_column(3, 120, "Direction");
-    add_column(4, 700, "Data");
+    add_column(list, 0, 100, "ID");
+    add_column(list, 1, 90, "Size");
+    add_column(list, 2, 260, "Name");
+    add_column(list, 3, 700, "Data");
 }
 
-void set_item_text(int row, int column, const char* text)
+void set_item_text(HWND list, int row, int column, const char* text)
 {
-    if (!g_list) return;
+    if (!list) return;
 
     LVITEMA item{};
     item.mask = LVIF_TEXT;
@@ -131,7 +162,7 @@ void set_item_text(int row, int column, const char* text)
     item.pszText = const_cast<char*>(text);
 
     SendMessageA(
-        g_list,
+        list,
         LVM_SETITEMTEXTA,
         static_cast<WPARAM>(row),
         reinterpret_cast<LPARAM>(&item)
@@ -139,23 +170,30 @@ void set_item_text(int row, int column, const char* text)
 }
 
 void insert_row(
-    const char* type,
+    EventType type,
+    Direction direction,
     const char* id,
     const char* size,
-    const char* direction,
+    const char* name,
     const char* data
 )
 {
-    if (!g_list) return;
+    HWND list = g_lists[
+        type == EventType::Packet ? 0 : 1
+    ][
+        direction == Direction::Incoming ? 0 : 1
+    ];
+
+    if (!list) return;
 
     LVITEMA item{};
     item.mask = LVIF_TEXT;
     item.iItem = 0;
     item.iSubItem = 0;
-    item.pszText = const_cast<char*>(type);
+    item.pszText = const_cast<char*>(id);
 
     const LRESULT row = SendMessageA(
-        g_list,
+        list,
         LVM_INSERTITEMA,
         0,
         reinterpret_cast<LPARAM>(&item)
@@ -163,15 +201,14 @@ void insert_row(
 
     if (row < 0) return;
 
-    set_item_text(static_cast<int>(row), 1, id);
-    set_item_text(static_cast<int>(row), 2, size);
-    set_item_text(static_cast<int>(row), 3, direction);
-    set_item_text(static_cast<int>(row), 4, data);
+    set_item_text(list, static_cast<int>(row), 1, size);
+    set_item_text(list, static_cast<int>(row), 2, name);
+    set_item_text(list, static_cast<int>(row), 3, data);
 
-    if (g_auto_scroll)
+    if (g_auto_scroll && list == current_list())
     {
         SendMessageA(
-            g_list,
+            list,
             LVM_ENSUREVISIBLE,
             static_cast<WPARAM>(row),
             TRUE
@@ -181,8 +218,6 @@ void insert_row(
 
 void parse_event(const std::string& message)
 {
-    if (!matches_filter(message)) return;
-
     std::string parts[5];
     size_t start = 0;
 
@@ -204,13 +239,54 @@ void parse_event(const std::string& message)
     if (start <= message.size())
         parts[4] = message.substr(start);
 
+    EventType type;
+    if (parts[0] == "RPC")
+        type = EventType::Rpc;
+    else if (parts[0] == "PACKET")
+        type = EventType::Packet;
+    else
+        return;
+
+    Direction direction;
+    if (parts[3] == "IN")
+        direction = Direction::Incoming;
+    else if (parts[3] == "OUT")
+        direction = Direction::Outgoing;
+    else
+        return;
+
+    if (!matches_filter(message)) return;
+
+    std::string name = parts[4];
+    std::string data;
+
+    const size_t detail_pos = name.find(" | ");
+    if (detail_pos != std::string::npos)
+    {
+        data = name.substr(detail_pos + 3);
+        name = name.substr(0, detail_pos);
+    }
+
     insert_row(
-        parts[0].c_str(),
+        type,
+        direction,
         parts[1].c_str(),
         parts[2].c_str(),
-        parts[3].c_str(),
-        parts[4].c_str()
+        name.c_str(),
+        data.c_str()
     );
+}
+
+void clear_all_lists()
+{
+    for (auto& type : g_lists)
+    {
+        for (HWND list : type)
+        {
+            if (list)
+                SendMessageA(list, LVM_DELETEALLITEMS, 0, 0);
+        }
+    }
 }
 
 void flush_pending()
@@ -237,10 +313,85 @@ void flush_pending()
         std::lock_guard<std::mutex> lock(g_mutex);
 
         if (!g_pending.empty() && g_hwnd)
-        {
             PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
-        }
     }
+}
+
+void create_tabs(HWND hwnd)
+{
+    g_type_tabs = CreateWindowExA(
+        0,
+        WC_TABCONTROLA,
+        "",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+        10, 42, 250, 32,
+        hwnd,
+        reinterpret_cast<HMENU>(IDC_TYPE_TABS),
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    SendMessageA(g_type_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
+    TCITEMA item{};
+    item.mask = TCIF_TEXT;
+
+    item.pszText = const_cast<char*>("Packet");
+    TabCtrl_InsertItem(g_type_tabs, 0, &item);
+
+    item.pszText = const_cast<char*>("RPC");
+    TabCtrl_InsertItem(g_type_tabs, 1, &item);
+
+    g_dir_tabs = CreateWindowExA(
+        0,
+        WC_TABCONTROLA,
+        "",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+        270, 42, 250, 32,
+        hwnd,
+        reinterpret_cast<HMENU>(IDC_DIR_TABS),
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    SendMessageA(g_dir_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
+    item.pszText = const_cast<char*>("IN");
+    TabCtrl_InsertItem(g_dir_tabs, 0, &item);
+
+    item.pszText = const_cast<char*>("OUT");
+    TabCtrl_InsertItem(g_dir_tabs, 1, &item);
+}
+
+HWND create_list(HWND hwnd, int type, int direction)
+{
+    const int id = IDC_LIST_BASE + type * 2 + direction;
+
+    HWND list = CreateWindowExA(
+        WS_EX_CLIENTEDGE,
+        WC_LISTVIEWA,
+        "",
+        WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        10, 78, 1000, 570,
+        hwnd,
+        reinterpret_cast<HMENU>(id),
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    if (!list) return nullptr;
+
+    SendMessageA(list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
+    SendMessageA(
+        list,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
+        0,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER
+    );
+
+    add_columns(list);
+    return list;
 }
 
 void create_controls(HWND hwnd)
@@ -272,7 +423,6 @@ void create_controls(HWND hwnd)
         GetModuleHandleA(nullptr),
         nullptr
     );
-
     SendMessageA(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
     g_autoscroll = CreateWindowExA(
@@ -286,7 +436,6 @@ void create_controls(HWND hwnd)
         GetModuleHandleA(nullptr),
         nullptr
     );
-
     SendMessageA(g_autoscroll, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
     SendMessageA(g_autoscroll, BM_SETCHECK, BST_CHECKED, 0);
 
@@ -301,31 +450,43 @@ void create_controls(HWND hwnd)
         GetModuleHandleA(nullptr),
         nullptr
     );
-
     SendMessageA(clear, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 
-    g_list = CreateWindowExA(
-        WS_EX_CLIENTEDGE,
-        WC_LISTVIEWA,
-        "",
-        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        10, 45, 1000, 600,
-        hwnd,
-        reinterpret_cast<HMENU>(IDC_LIST),
-        GetModuleHandleA(nullptr),
-        nullptr
-    );
+    create_tabs(hwnd);
 
-    SendMessageA(g_list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    for (int type = 0; type < 2; ++type)
+    {
+        for (int direction = 0; direction < 2; ++direction)
+            g_lists[type][direction] = create_list(hwnd, type, direction);
+    }
 
-    SendMessageA(
-        g_list,
-        LVM_SETEXTENDEDLISTVIEWSTYLE,
-        0,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER
-    );
+    show_active_list();
+}
 
-    add_columns();
+void resize_controls(int width, int height)
+{
+    if (g_type_tabs)
+        MoveWindow(g_type_tabs, 10, 42, 250, 32, TRUE);
+
+    if (g_dir_tabs)
+        MoveWindow(g_dir_tabs, 270, 42, 250, 32, TRUE);
+
+    for (auto& type : g_lists)
+    {
+        for (HWND list : type)
+        {
+            if (list)
+            {
+                MoveWindow(
+                    list,
+                    10, 78,
+                    std::max(100, width - 20),
+                    std::max(100, height - 88),
+                    TRUE
+                );
+            }
+        }
+    }
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -352,14 +513,34 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
+        case WM_NOTIFY:
+        {
+            const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
+
+            if (header && header->code == TCN_SELCHANGE)
+            {
+                if (header->idFrom == IDC_TYPE_TABS)
+                {
+                    g_type_tab = TabCtrl_GetCurSel(g_type_tabs);
+                    show_active_list();
+                }
+                else if (header->idFrom == IDC_DIR_TABS)
+                {
+                    g_dir_tab = TabCtrl_GetCurSel(g_dir_tabs);
+                    show_active_list();
+                }
+            }
+
+            return 0;
+        }
+
         case WM_COMMAND:
         {
             const int id = LOWORD(wParam);
 
             if (id == IDC_CLEAR)
             {
-                if (g_list)
-                    SendMessageA(g_list, LVM_DELETEALLITEMS, 0, 0);
+                clear_all_lists();
                 return 0;
             }
 
@@ -373,8 +554,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (id == IDC_FILTER && HIWORD(wParam) == EN_CHANGE)
             {
                 set_filter_text();
-                if (g_list)
-                    SendMessageA(g_list, LVM_DELETEALLITEMS, 0, 0);
+                clear_all_lists();
                 return 0;
             }
 
@@ -383,19 +563,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case WM_SIZE:
         {
-            const int width = LOWORD(lParam);
-            const int height = HIWORD(lParam);
-
-            if (g_list)
-            {
-                MoveWindow(
-                    g_list,
-                    10, 45,
-                    std::max(100, width - 20),
-                    std::max(100, height - 55),
-                    TRUE
-                );
-            }
+            resize_controls(LOWORD(lParam), HIWORD(lParam));
             return 0;
         }
 
@@ -406,10 +574,17 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_DESTROY:
         {
             KillTimer(hwnd, 1);
+
             g_hwnd = nullptr;
             g_filter = nullptr;
-            g_list = nullptr;
             g_autoscroll = nullptr;
+            g_type_tabs = nullptr;
+            g_dir_tabs = nullptr;
+
+            for (auto& type : g_lists)
+                for (HWND& list : type)
+                    list = nullptr;
+
             PostQuitMessage(0);
             return 0;
         }
@@ -424,7 +599,7 @@ void gui_thread_proc()
 
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
+    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icc);
 
     WNDCLASSEXA wc{};
@@ -439,7 +614,6 @@ void gui_thread_proc()
     {
         const DWORD error = GetLastError();
 
-        // ERROR_CLASS_ALREADY_EXISTS is harmless for a repeated start.
         if (error != ERROR_CLASS_ALREADY_EXISTS)
         {
             log::error(
@@ -463,8 +637,8 @@ void gui_thread_proc()
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        1100,
-        700,
+        1200,
+        750,
         nullptr,
         nullptr,
         instance,
@@ -489,8 +663,6 @@ void gui_thread_proc()
         return;
     }
 
-    // Publish the HWND before notifying start(). This removes the startup race
-    // where WM_CREATE set g_ready before g_hwnd was assigned.
     g_hwnd = hwnd;
 
     ShowWindow(hwnd, SW_SHOW);
@@ -504,7 +676,6 @@ void gui_thread_proc()
     }
     g_state_cv.notify_all();
 
-    // Flush anything that arrived while the window was being created.
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_pending.empty())
