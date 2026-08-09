@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstddef>
 #include <string>
+#include <utility>
 
 namespace {
 std::atomic_bool g_installed{false};
