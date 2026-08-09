@@ -3,6 +3,7 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <utility>
 
 namespace {
 constexpr std::size_t kMaxPending = 4096;
