@@ -17,26 +17,15 @@ constexpr std::size_t MAX_HEX_DUMP = 256;
 
 const char* direction_name(intercept::events::Direction direction)
 {
-    return direction == intercept::events::Direction::Incoming
-        ? "IN"
-        : "OUT";
+    return direction == intercept::events::Direction::Incoming ? "IN" : "OUT";
 }
 
 void publish_gui(const intercept::events::Event& event)
 {
-    const char* type =
-        event.kind == intercept::events::Kind::Packet
-            ? "PACKET"
-            : "RPC";
+    const char* type = event.kind == intercept::events::Kind::Packet ? "PACKET" : "RPC";
 
     std::string message;
-
-    message.reserve(
-        event.name.size() +
-        event.details.size() +
-        event.hex.size() +
-        64
-    );
+    message.reserve(event.name.size() + event.details.size() + event.hex.size() + 64);
 
     message += type;
     message += '|';
@@ -48,14 +37,12 @@ void publish_gui(const intercept::events::Event& event)
     message += '|';
     message += event.name;
 
-    if (!event.details.empty())
-    {
+    if (!event.details.empty()) {
         message += " | ";
         message += event.details;
     }
 
-    if (!event.hex.empty())
-    {
+    if (!event.hex.empty()) {
         message += " | HEX: ";
         message += event.hex;
     }
@@ -135,27 +122,34 @@ void push_rpc(intercept::events::Direction direction, unsigned char id, RakNet::
 
 void register_callbacks()
 {
+    intercept::log::info("[HOOK] Registering on_send_packet callback.");
     rakhook::on_send_packet +=
         [](RakNet::BitStream* bs, PacketPriority&, PacketReliability&, char&) -> bool {
+            intercept::log::info("[HOOK] on_send_packet fired.");
             push_packet(intercept::events::Direction::Outgoing, bs);
             return true;
         };
 
+    intercept::log::info("[HOOK] Registering on_receive_packet callback.");
     rakhook::on_receive_packet +=
         [](Packet* packet) -> bool {
+            intercept::log::info("[HOOK] on_receive_packet fired.");
             push_packet(intercept::events::Direction::Incoming, packet);
             return true;
         };
 
+    intercept::log::info("[HOOK] Registering on_send_rpc callback.");
     rakhook::on_send_rpc +=
         [](int& id, RakNet::BitStream* bs, PacketPriority&, PacketReliability&, char&, bool&) -> bool {
-            push_rpc(intercept::events::Direction::Outgoing,
-                     static_cast<unsigned char>(id), bs);
+            intercept::log::info("[HOOK] on_send_rpc fired. id=" + std::to_string(id));
+            push_rpc(intercept::events::Direction::Outgoing, static_cast<unsigned char>(id), bs);
             return true;
         };
 
+    intercept::log::info("[HOOK] Registering on_receive_rpc callback.");
     rakhook::on_receive_rpc +=
         [](unsigned char& id, RakNet::BitStream* bs) -> bool {
+            intercept::log::info("[HOOK] on_receive_rpc fired. id=" + std::to_string(id));
             push_rpc(intercept::events::Direction::Incoming, id, bs);
             return true;
         };
