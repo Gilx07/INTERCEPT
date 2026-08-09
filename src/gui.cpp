@@ -7,6 +7,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,7 @@
 #include "monitor.hpp"
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 namespace intercept::gui {
 namespace {
@@ -128,12 +130,106 @@ bool matches_filter(const std::string& event)
 
 void set_filter_text()
 {
-    if (!g_filter) return;
-    char buffer[1024]{};
-    GetWindowTextA(g_filter, buffer, static_cast<int>(sizeof(buffer)));
+    char buffer[512]{};
+    GetWindowTextA(g_filter, buffer, sizeof(buffer));
     g_filter_text = buffer;
     std::transform(g_filter_text.begin(), g_filter_text.end(), g_filter_text.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+}
+
+EventRecord parse_event(const std::string& event)
+{
+    EventRecord record;
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (start <= event.size()) {
+        const size_t pos = event.find('|', start);
+        if (pos == std::string::npos) {
+            parts.push_back(event.substr(start));
+            break;
+        }
+        parts.push_back(event.substr(start, pos - start));
+        start = pos + 1;
+    }
+
+    if (!parts.empty()) record.type = parts[0] == "RPC" ? EventType::Rpc : EventType::Packet;
+    if (parts.size() > 1) record.id = std::atoi(parts[1].c_str());
+    if (parts.size() > 2) record.size = parts[2];
+    if (parts.size() > 3) record.direction = parts[3] == "OUT" ? Direction::Outgoing : Direction::Incoming;
+    if (parts.size() > 4) record.name = parts[4];
+
+    if (parts.size() > 5) {
+        record.data = parts[5];
+        const std::string prefix = "HEX: ";
+        const size_t hex_pos = record.data.find(prefix);
+        if (hex_pos != std::string::npos) {
+            record.hex = record.data.substr(hex_pos + prefix.size());
+            record.data.erase(hex_pos);
+        }
+    }
+    return record;
+}
+
+void add_record_to_list(const EventRecord& record)
+{
+    const int type = type_index(record.type);
+    const int dir = dir_index(record.direction);
+    auto& records = g_records[type][dir];
+    records.push_back(record);
+    while (records.size() > MAX_ROWS_PER_LIST) records.pop_front();
+
+    HWND list = g_lists[type][dir];
+    if (!list || !matches_filter(record.name + " " + record.data)) return;
+
+    char id_buf[32]{};
+    _snprintf_s(id_buf, _TRUNCATE, "%d", record.id);
+    const int item = ListView_GetItemCount(list);
+    LVITEMA lv{};
+    lv.mask = LVIF_TEXT;
+    lv.iItem = item;
+    lv.iSubItem = 0;
+    lv.pszText = id_buf;
+    ListView_InsertItemA(list, &lv);
+
+    ListView_SetItemText(list, item, 1, const_cast<char*>(record.size.c_str()));
+    ListView_SetItemText(list, item, 2, const_cast<char*>(record.name.c_str()));
+    ListView_SetItemText(list, item, 3, const_cast<char*>(record.data.c_str()));
+}
+
+void flush_pending()
+{
+    std::deque<std::string> local;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const size_t count = std::min(MAX_EVENTS_PER_TICK, g_pending.size());
+        for (size_t i = 0; i < count; ++i) {
+            local.push_back(std::move(g_pending.front()));
+            g_pending.pop_front();
+        }
+        g_event_message_pending = !g_pending.empty();
+    }
+
+    HWND list = current_list();
+    if (list && !local.empty()) SendMessageA(list, WM_SETREDRAW, FALSE, 0);
+    for (const auto& event : local) add_record_to_list(parse_event(event));
+    if (list && !local.empty()) {
+        SendMessageA(list, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(list, nullptr, TRUE);
+        if (g_auto_scroll) ListView_EnsureVisible(list, ListView_GetItemCount(list) - 1, FALSE);
+    }
+
+    if (g_event_message_pending && g_hwnd) PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
+}
+
+void clear_all_lists()
+{
+    for (auto& by_type : g_records)
+        for (auto& by_dir : by_type)
+            by_dir.clear();
+
+    for (auto& by_type : g_lists)
+        for (HWND list : by_type)
+            if (list) ListView_DeleteAllItems(list);
 }
 
 void show_active_list()
@@ -144,396 +240,35 @@ void show_active_list()
                 ShowWindow(g_lists[type][dir], type == g_type_tab && dir == g_dir_tab ? SW_SHOW : SW_HIDE);
 }
 
-void add_column(HWND list, int index, int width, const char* text)
+void configure_list(HWND list)
 {
-    LVCOLUMNA column{};
-    column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-    column.cx = width;
-    column.pszText = const_cast<char*>(text);
-    column.iSubItem = index;
-    SendMessageA(list, LVM_INSERTCOLUMNA, static_cast<WPARAM>(index), reinterpret_cast<LPARAM>(&column));
-}
-
-void add_columns(HWND list)
-{
-    add_column(list, 0, 80, "ID");
-    add_column(list, 1, 80, "Size");
-    add_column(list, 2, 260, "Name");
-    add_column(list, 3, 900, "Data / HEX");
-}
-
-void set_item_text(HWND list, int row, int column, const char* text)
-{
-    LVITEMA item{};
-    item.mask = LVIF_TEXT;
-    item.iItem = row;
-    item.iSubItem = column;
-    item.pszText = const_cast<char*>(text);
-    SendMessageA(list, LVM_SETITEMTEXTA, static_cast<WPARAM>(row), reinterpret_cast<LPARAM>(&item));
-}
-
-void insert_row(const EventRecord& event)
-{
-    const int ti = type_index(event.type);
-    const int di = dir_index(event.direction);
-    HWND list = g_lists[ti][di];
-    if (!list) return;
-
-    auto& records = g_records[ti][di];
-    records.push_back(event);
-
-    if (records.size() > MAX_ROWS_PER_LIST)
-    {
-        records.pop_front();
-        SendMessageA(list, LVM_DELETEITEM, 0, 0);
-    }
-
-    const int row_index = static_cast<int>(records.size()) - 1;
-    const std::string id = std::to_string(event.id);
-
-    LVITEMA item{};
-    item.mask = LVIF_TEXT;
-    item.iItem = row_index;
-    item.pszText = const_cast<char*>(id.c_str());
-
-    const LRESULT row = SendMessageA(list, LVM_INSERTITEMA, static_cast<WPARAM>(row_index), reinterpret_cast<LPARAM>(&item));
-    if (row < 0) return;
-
-    set_item_text(list, row_index, 1, event.size.c_str());
-    set_item_text(list, row_index, 2, event.name.c_str());
-
-    std::string display = event.data;
-    if (!event.hex.empty())
-    {
-        if (!display.empty()) display += " | ";
-        display += "HEX: ";
-        display += event.hex;
-    }
-    set_item_text(list, row_index, 3, display.c_str());
-}
-
-EventRecord parse_event(const std::string& message, bool* accepted = nullptr)
-{
-    EventRecord event;
-    if (accepted) *accepted = false;
-
-    std::string parts[5];
-    size_t start = 0;
-    for (int i = 0; i < 4; ++i)
-    {
-        const size_t pos = message.find('|', start);
-        if (pos == std::string::npos)
-        {
-            parts[i] = message.substr(start);
-            start = message.size();
-            break;
-        }
-        parts[i] = message.substr(start, pos - start);
-        start = pos + 1;
-    }
-    if (start <= message.size()) parts[4] = message.substr(start);
-
-    if (parts[0] == "PACKET") event.type = EventType::Packet;
-    else if (parts[0] == "RPC") event.type = EventType::Rpc;
-    else return event;
-
-    if (parts[3] == "IN") event.direction = Direction::Incoming;
-    else if (parts[3] == "OUT") event.direction = Direction::Outgoing;
-    else return event;
-
-    if (!matches_filter(message)) return event;
-
-    try { event.id = std::stoi(parts[1]); } catch (...) { event.id = -1; }
-    event.size = parts[2];
-
-    std::string payload = parts[4];
-    const size_t detail_pos = payload.find(" | ");
-    if (detail_pos == std::string::npos)
-    {
-        event.name = payload;
-        if (accepted) *accepted = true;
-        return event;
-    }
-
-    event.name = payload.substr(0, detail_pos);
-    std::string detail = payload.substr(detail_pos + 3);
-    const std::string hex_tag = "HEX: ";
-    const size_t hex_pos = detail.rfind(hex_tag);
-    if (hex_pos != std::string::npos)
-    {
-        event.hex = detail.substr(hex_pos + hex_tag.size());
-        detail.erase(hex_pos);
-        while (!detail.empty() && (detail.back() == ' ' || detail.back() == '|')) detail.pop_back();
-    }
-    event.data = detail;
-    if (accepted) *accepted = true;
-    return event;
-}
-
-void clear_all_lists()
-{
-    for (int type = 0; type < 2; ++type)
-        for (int dir = 0; dir < 2; ++dir)
-        {
-            g_records[type][dir].clear();
-            if (g_lists[type][dir]) SendMessageA(g_lists[type][dir], LVM_DELETEALLITEMS, 0, 0);
-        }
-}
-
-void flush_pending()
-{
-    g_event_message_pending = false;
-
-    std::vector<std::string> events;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        const size_t count = std::min(MAX_EVENTS_PER_TICK, g_pending.size());
-        events.reserve(count);
-        for (size_t i = 0; i < count; ++i)
-        {
-            events.emplace_back(std::move(g_pending.front()));
-            g_pending.pop_front();
-        }
-    }
-
-    for (int type = 0; type < 2; ++type)
-        for (int dir = 0; dir < 2; ++dir)
-            if (g_lists[type][dir]) SendMessageA(g_lists[type][dir], WM_SETREDRAW, FALSE, 0);
-
-    for (const auto& raw : events)
-    {
-        bool accepted = false;
-        EventRecord event = parse_event(raw, &accepted);
-        if (accepted) insert_row(event);
-    }
-
-    for (int type = 0; type < 2; ++type)
-        for (int dir = 0; dir < 2; ++dir)
-            if (g_lists[type][dir])
-            {
-                SendMessageA(g_lists[type][dir], WM_SETREDRAW, TRUE, 0);
-                InvalidateRect(g_lists[type][dir], nullptr, FALSE);
-            }
-
-    HWND list = current_list();
-    if (g_auto_scroll && list)
-    {
-        const int count = static_cast<int>(SendMessageA(list, LVM_GETITEMCOUNT, 0, 0));
-        if (count > 0)
-            SendMessageA(list, LVM_ENSUREVISIBLE, static_cast<WPARAM>(count - 1), TRUE);
-    }
-
-    bool more = false;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        more = !g_pending.empty();
-    }
-
-    if (more)
-    {
-        bool expected = false;
-        if (g_event_message_pending.compare_exchange_strong(expected, true) && g_hwnd)
-            PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    const char* columns[] = { "ID", "Size", "Name", "Data" };
+    const int widths[] = { 70, 80, 220, 520 };
+    for (int i = 0; i < 4; ++i) {
+        LVCOLUMNA col{};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.pszText = const_cast<char*>(columns[i]);
+        col.cx = widths[i];
+        ListView_InsertColumn(list, i, &col);
     }
 }
 
-void set_clipboard_text(const std::string& text)
+void set_font(HWND hwnd)
 {
-    if (!g_hwnd || !OpenClipboard(g_hwnd)) return;
-    EmptyClipboard();
-    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
-    if (!memory) { CloseClipboard(); return; }
-    void* ptr = GlobalLock(memory);
-    if (!ptr) { GlobalFree(memory); CloseClipboard(); return; }
-    std::memcpy(ptr, text.c_str(), text.size() + 1);
-    GlobalUnlock(memory);
-    SetClipboardData(CF_TEXT, memory);
-    CloseClipboard();
-}
-
-void send_detail(HWND hwnd, DetailState* state)
-{
-    char buffer[65536]{};
-    GetWindowTextA(state->hex, buffer, static_cast<int>(sizeof(buffer)));
-    const std::string hex = buffer;
-    bool ok = state->event.type == EventType::Packet
-        ? monitor::send_packet_hex(hex)
-        : monitor::send_rpc_hex(state->event.id, hex);
-
-    MessageBoxA(hwnd, ok ? "Send successful." : "Send failed. Check HEX and packet/RPC state.",
-        "INTERCEPT", ok ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONERROR);
-}
-
-void create_detail_controls(HWND hwnd, DetailState* state)
-{
-    apply_dark_theme(hwnd);
-    const char* type = state->event.type == EventType::Packet ? "PACKET" : "RPC";
-    const char* direction = state->event.direction == Direction::Incoming ? "IN" : "OUT";
-
-    auto static_text = [&](const char* text, int x, int y, int w, int h) {
-        HWND control = CreateWindowExA(0, "STATIC", text, WS_CHILD | WS_VISIBLE,
-            x, y, w, h, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
-        apply_dark_control(control);
-        SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    };
-
-    static_text((std::string("Type: ") + type).c_str(), 15, 15, 180, 22);
-    static_text((std::string("Direction: ") + direction).c_str(), 210, 15, 180, 22);
-    static_text((std::string("ID: ") + std::to_string(state->event.id)).c_str(), 405, 15, 120, 22);
-    static_text((std::string("Name: ") + state->event.name).c_str(), 15, 42, 600, 22);
-
-    HWND label = CreateWindowExA(0, "STATIC", "HEX (editable):", WS_CHILD | WS_VISIBLE,
-        15, 72, 150, 22, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
-    apply_dark_control(label);
-    SendMessageA(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-
-    state->hex = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", state->event.hex.c_str(),
-        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOHSCROLL | ES_WANTRETURN | WS_VSCROLL,
-        15, 98, 680, 300, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_HEX), GetModuleHandleA(nullptr), nullptr);
-    SendMessageA(state->hex, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageA(state->hex, EM_SETLIMITTEXT, 65535, 0);
-
-    HWND copy = CreateWindowExA(0, "BUTTON", "Copy HEX", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        15, 415, 110, 30, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_COPY), GetModuleHandleA(nullptr), nullptr);
-    HWND send = CreateWindowExA(0, "BUTTON", "Send", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        135, 415, 100, 30, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_SEND), GetModuleHandleA(nullptr), nullptr);
-    HWND close = CreateWindowExA(0, "BUTTON", "Close", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        595, 415, 100, 30, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_CLOSE), GetModuleHandleA(nullptr), nullptr);
-    apply_dark_control(copy);
-    apply_dark_control(send);
-    apply_dark_control(close);
-    SendMessageA(copy, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageA(send, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageA(close, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-}
-
-LRESULT CALLBACK detail_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    auto* state = reinterpret_cast<DetailState*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
-    switch (msg)
-    {
-        case WM_CREATE:
-        {
-            auto* cs = reinterpret_cast<CREATESTRUCTA*>(lParam);
-            state = static_cast<DetailState*>(cs->lpCreateParams);
-            SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
-            create_detail_controls(hwnd, state);
-            return 0;
-        }
-        case WM_CTLCOLOREDIT:
-        {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, C_TEXT);
-            SetBkColor(dc, C_INPUT);
-            static HBRUSH brush = CreateSolidBrush(C_INPUT);
-            return reinterpret_cast<LRESULT>(brush);
-        }
-        case WM_CTLCOLORSTATIC:
-        {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, C_TEXT);
-            SetBkColor(dc, C_BG);
-            static HBRUSH brush = CreateSolidBrush(C_BG);
-            return reinterpret_cast<LRESULT>(brush);
-        }
-        case WM_CTLCOLORBTN:
-        {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, C_TEXT);
-            SetBkColor(dc, C_PANEL);
-            static HBRUSH brush = CreateSolidBrush(C_PANEL);
-            return reinterpret_cast<LRESULT>(brush);
-        }
-        case WM_ERASEBKGND:
-        {
-            RECT rect{};
-            GetClientRect(hwnd, &rect);
-            HBRUSH brush = CreateSolidBrush(C_BG);
-            FillRect(reinterpret_cast<HDC>(wParam), &rect, brush);
-            DeleteObject(brush);
-            return 1;
-        }
-        case WM_COMMAND:
-        {
-            if (!state) return 0;
-            const int id = LOWORD(wParam);
-            if (id == IDC_DETAIL_COPY)
-            {
-                char buffer[65536]{};
-                GetWindowTextA(state->hex, buffer, static_cast<int>(sizeof(buffer)));
-                set_clipboard_text(buffer);
-                return 0;
-            }
-            if (id == IDC_DETAIL_SEND)
-            {
-                send_detail(hwnd, state);
-                return 0;
-            }
-            if (id == IDC_DETAIL_CLOSE)
-            {
-                DestroyWindow(hwnd);
-                return 0;
-            }
-            return 0;
-        }
-        case WM_CLOSE:
-            DestroyWindow(hwnd);
-            return 0;
-        case WM_NCDESTROY:
-            delete state;
-            SetWindowLongPtrA(hwnd, GWLP_USERDATA, 0);
-            return 0;
-    }
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
-}
-
-void open_detail(const EventRecord& event)
-{
-    static bool registered = false;
-    HINSTANCE instance = GetModuleHandleA(nullptr);
-    const char* class_name = "INTERCEPT_DETAIL";
-    if (!registered)
-    {
-        WNDCLASSEXA wc{};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = detail_proc;
-        wc.hInstance = instance;
-        wc.lpszClassName = class_name;
-        wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
-        wc.hbrBackground = CreateSolidBrush(C_BG);
-        RegisterClassExA(&wc);
-        registered = true;
-    }
-
-    auto* state = new DetailState(event);
-    HWND hwnd = CreateWindowExA(WS_EX_DLGMODALFRAME, class_name,
-        "INTERCEPT - Packet Detail",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 730, 490,
-        g_hwnd, nullptr, instance, state);
-    if (!hwnd) { delete state; return; }
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
-    SetForegroundWindow(hwnd);
+    if (hwnd && g_font) SendMessageA(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
 }
 
 void create_tabs(HWND hwnd)
 {
-    g_type_tabs = CreateWindowExA(0, WC_TABCONTROLA, "",
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED,
-        10, 42, 250, 32, hwnd, reinterpret_cast<HMENU>(IDC_TYPE_TABS), GetModuleHandleA(nullptr), nullptr);
-    g_dir_tabs = CreateWindowExA(0, WC_TABCONTROLA, "",
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED,
-        270, 42, 250, 32, hwnd, reinterpret_cast<HMENU>(IDC_DIR_TABS), GetModuleHandleA(nullptr), nullptr);
-
-    apply_dark_control(g_type_tabs);
-    apply_dark_control(g_dir_tabs);
-    SendMessageA(g_type_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageA(g_dir_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    g_type_tabs = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE | TCS_OWNERDRAWFIXED,
+        12, 54, 180, 30, hwnd, reinterpret_cast<HMENU>(IDC_TYPE_TABS), GetModuleHandleA(nullptr), nullptr);
+    g_dir_tabs = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE | TCS_OWNERDRAWFIXED,
+        202, 54, 180, 30, hwnd, reinterpret_cast<HMENU>(IDC_DIR_TABS), GetModuleHandleA(nullptr), nullptr);
 
     TCITEMA item{};
     item.mask = TCIF_TEXT;
-    item.pszText = const_cast<char*>("Packet");
+    item.pszText = const_cast<char*>("PACKET");
     TabCtrl_InsertItem(g_type_tabs, 0, &item);
     item.pszText = const_cast<char*>("RPC");
     TabCtrl_InsertItem(g_type_tabs, 1, &item);
@@ -543,388 +278,317 @@ void create_tabs(HWND hwnd)
     TabCtrl_InsertItem(g_dir_tabs, 1, &item);
 }
 
-HWND create_list(HWND hwnd, int type, int direction)
+void create_lists(HWND hwnd)
 {
-    const int id = IDC_LIST_BASE + type * 2 + direction;
-    HWND list = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
-        WS_CHILD | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-        10, 78, 1000, 570, hwnd, reinterpret_cast<HMENU>(id), GetModuleHandleA(nullptr), nullptr);
-    if (!list) return nullptr;
-    apply_dark_control(list);
-    SendMessageA(list, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageA(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
-    add_columns(list);
-    return list;
+    for (int type = 0; type < 2; ++type) {
+        for (int dir = 0; dir < 2; ++dir) {
+            g_lists[type][dir] = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
+                WS_CHILD | LVS_REPORT | LVS_SHOWSELALWAYS | WS_VSCROLL,
+                12, 90, 980, 520, hwnd,
+                reinterpret_cast<HMENU>(IDC_LIST_BASE + type * 2 + dir), GetModuleHandleA(nullptr), nullptr);
+            configure_list(g_lists[type][dir]);
+            apply_dark_control(g_lists[type][dir]);
+            set_font(g_lists[type][dir]);
+        }
+    }
 }
 
-void create_controls(HWND hwnd)
+void draw_tab(const DRAWITEMSTRUCT* dis)
 {
-    g_font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    if (!dis || !dis->hwndItem) return;
+    HWND tabs = dis->hwndItem;
+    const bool type_tabs = tabs == g_type_tabs;
+    const int selected = TabCtrl_GetCurSel(tabs);
+    const int index = static_cast<int>(dis->itemID);
 
-    g_filter = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        10, 10, 300, 24, hwnd, reinterpret_cast<HMENU>(IDC_FILTER), GetModuleHandleA(nullptr), nullptr);
-    apply_dark_control(g_filter);
-    SendMessageA(g_filter, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-
-    HWND label = CreateWindowExA(0, "STATIC", "Filter:", WS_CHILD | WS_VISIBLE,
-        320, 13, 50, 20, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
-    apply_dark_control(label);
-    SendMessageA(label, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-
-    g_autoscroll = CreateWindowExA(0, "BUTTON", "Auto Scroll", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-        390, 10, 110, 24, hwnd, reinterpret_cast<HMENU>(IDC_AUTOSCROLL), GetModuleHandleA(nullptr), nullptr);
-    apply_dark_control(g_autoscroll);
-    SendMessageA(g_autoscroll, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    SendMessageA(g_autoscroll, BM_SETCHECK, BST_CHECKED, 0);
-
-    HWND clear = CreateWindowExA(0, "BUTTON", "Clear", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        510, 10, 80, 24, hwnd, reinterpret_cast<HMENU>(IDC_CLEAR), GetModuleHandleA(nullptr), nullptr);
-    apply_dark_control(clear);
-    SendMessageA(clear, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-
-    create_tabs(hwnd);
-    for (int type = 0; type < 2; ++type)
-        for (int direction = 0; direction < 2; ++direction)
-            g_lists[type][direction] = create_list(hwnd, type, direction);
-    show_active_list();
-}
-
-void resize_controls(int width, int height)
-{
-    if (g_type_tabs) MoveWindow(g_type_tabs, 10, 42, 250, 32, TRUE);
-    if (g_dir_tabs) MoveWindow(g_dir_tabs, 270, 42, 250, 32, TRUE);
-    for (auto& type : g_lists)
-        for (HWND list : type)
-            if (list) MoveWindow(list, 10, 78, std::max(100, width - 20), std::max(100, height - 88), TRUE);
-}
-
-void draw_owner_tab(const DRAWITEMSTRUCT* dis)
-{
-    if (!dis || dis->CtlType != ODT_TAB) return;
-
-    const int tab_index = static_cast<int>(dis->itemID);
-    const bool type_tab = dis->CtlID == IDC_TYPE_TABS;
-    const bool selected = (type_tab ? g_type_tab : g_dir_tab) == tab_index;
-
-    COLORREF color;
-    if (type_tab)
-        color = tab_index == 0 ? C_PACKET : C_RPC;
-    else
-        color = tab_index == 0 ? C_IN : C_OUT;
-
-    if (!selected)
-    {
-        color = RGB(
-            (GetRValue(color) + 48) / 2,
-            (GetGValue(color) + 48) / 2,
-            (GetBValue(color) + 48) / 2);
+    COLORREF bg = C_INPUT;
+    COLORREF text = C_TEXT;
+    if (type_tabs) bg = index == 0 ? C_PACKET : C_RPC;
+    else bg = index == 0 ? C_IN : C_OUT;
+    if (index != selected) {
+        bg = RGB((GetRValue(bg) + 30) / 2, (GetGValue(bg) + 30) / 2, (GetBValue(bg) + 30) / 2);
+        text = C_MUTED;
     }
 
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(dis->hDC, &dis->rcItem, brush);
-    DeleteObject(brush);
-
-    char text[128]{};
-    TCITEMA item{};
-    item.mask = TCIF_TEXT;
-    item.pszText = text;
-    item.cchTextMax = static_cast<int>(sizeof(text));
-    TabCtrl_GetItem(dis->hwndItem, tab_index, &item);
-
+    FillRect(dis->hDC, &dis->rcItem, CreateSolidBrush(bg));
     SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, RGB(255, 255, 255));
-    DrawTextA(dis->hDC, text, -1, const_cast<RECT*>(&dis->rcItem), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(dis->hDC, text);
+    DrawTextA(dis->hDC, index == 0 ? (type_tabs ? "PACKET" : "IN") : (type_tabs ? "RPC" : "OUT"),
+        -1, const_cast<RECT*>(&dis->rcItem), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
-void draw_list_item(const NMLVCUSTOMDRAW* draw)
+void open_detail(const EventRecord& event)
 {
-    if (!draw) return;
-    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
-        return;
+    auto* state = new DetailState{ event };
+
+    WNDCLASSA wc{};
+    wc.lpfnWndProc = detail_proc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = CreateSolidBrush(C_BG);
+    wc.lpszClassName = "INTERCEPT_PACKET_DETAIL";
+    static std::once_flag once;
+    std::call_once(once, [&]() { RegisterClassA(&wc); });
+
+    HWND detail = CreateWindowExA(WS_EX_DLGMODALFRAME, wc.lpszClassName,
+        event.type == EventType::Packet ? "Packet Detail" : "RPC Detail",
+        WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 720, 560, g_hwnd, nullptr, GetModuleHandleA(nullptr), state);
+    if (!detail) delete state;
+}
+
+LRESULT CALLBACK detail_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    auto* state = reinterpret_cast<DetailState*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTA*>(lParam);
+        state = reinterpret_cast<DetailState*>(cs->lpCreateParams);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+
+    switch (msg) {
+    case WM_CREATE:
+    {
+        apply_dark_theme(hwnd);
+        const EventRecord& e = state->event;
+        std::string title = "ID: " + std::to_string(e.id) + "    Size: " + e.size + "    Name: " + e.name;
+        CreateWindowExA(0, "STATIC", title.c_str(), WS_CHILD | WS_VISIBLE,
+            12, 12, 680, 24, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+        state->hex = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", e.hex.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+            12, 44, 680, 400, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_HEX), GetModuleHandleA(nullptr), nullptr);
+        apply_dark_control(state->hex);
+        SendMessageA(state->hex, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+        CreateWindowExA(0, "BUTTON", "Copy HEX", WS_CHILD | WS_VISIBLE,
+            12, 458, 110, 32, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_COPY), GetModuleHandleA(nullptr), nullptr);
+        CreateWindowExA(0, "BUTTON", "Send", WS_CHILD | WS_VISIBLE,
+            132, 458, 110, 32, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_SEND), GetModuleHandleA(nullptr), nullptr);
+        CreateWindowExA(0, "BUTTON", "Close", WS_CHILD | WS_VISIBLE,
+            582, 458, 110, 32, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_CLOSE), GetModuleHandleA(nullptr), nullptr);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_DETAIL_CLOSE) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_DETAIL_COPY) {
+            int len = GetWindowTextLengthA(state->hex);
+            std::string text(static_cast<size_t>(len), '\0');
+            GetWindowTextA(state->hex, text.data(), len + 1);
+            if (OpenClipboard(hwnd)) {
+                EmptyClipboard();
+                HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
+                if (mem) {
+                    void* ptr = GlobalLock(mem);
+                    memcpy(ptr, text.c_str(), text.size() + 1);
+                    GlobalUnlock(mem);
+                    SetClipboardData(CF_TEXT, mem);
+                }
+                CloseClipboard();
+            }
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_DETAIL_SEND) {
+            MessageBoxA(hwnd, "Send is available through the packet editor pipeline.", "INTERCEPT", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+    {
+        HDC dc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(dc, C_TEXT);
+        SetBkColor(dc, C_INPUT);
+        static HBRUSH brush = CreateSolidBrush(C_INPUT);
+        return reinterpret_cast<LRESULT>(brush);
+    }
+    case WM_DESTROY:
+        delete state;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    switch (msg)
+    switch (msg) {
+    case WM_CREATE:
+        apply_dark_theme(hwnd);
+        g_filter = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+            12, 12, 500, 30, hwnd, reinterpret_cast<HMENU>(IDC_FILTER), GetModuleHandleA(nullptr), nullptr);
+        g_autoscroll = CreateWindowExA(0, "BUTTON", "Auto Scroll", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+            520, 12, 120, 30, hwnd, reinterpret_cast<HMENU>(IDC_AUTOSCROLL), GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(g_autoscroll, BM_SETCHECK, BST_CHECKED, 0);
+        CreateWindowExA(0, "BUTTON", "Clear", WS_CHILD | WS_VISIBLE,
+            650, 12, 90, 30, hwnd, reinterpret_cast<HMENU>(IDC_CLEAR), GetModuleHandleA(nullptr), nullptr);
+        create_tabs(hwnd);
+        create_lists(hwnd);
+        apply_dark_control(g_filter);
+        apply_dark_control(g_autoscroll);
+        apply_dark_control(GetDlgItem(hwnd, IDC_CLEAR));
+        set_font(g_filter);
+        set_font(g_autoscroll);
+        set_font(GetDlgItem(hwnd, IDC_CLEAR));
+        show_active_list();
+        return 0;
+
+    case WM_SIZE:
     {
-        case WM_CREATE:
-            apply_dark_theme(hwnd);
-            create_controls(hwnd);
-            SetTimer(hwnd, 1, 50, nullptr);
-            return 0;
-
-        case WM_DRAWITEM:
-            draw_owner_tab(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
-            return TRUE;
-
-        case WM_CTLCOLOREDIT:
-        {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, C_TEXT);
-            SetBkColor(dc, C_INPUT);
-            static HBRUSH brush = CreateSolidBrush(C_INPUT);
-            return reinterpret_cast<LRESULT>(brush);
-        }
-
-        case WM_CTLCOLORSTATIC:
-        {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, C_TEXT);
-            SetBkColor(dc, C_BG);
-            static HBRUSH brush = CreateSolidBrush(C_BG);
-            return reinterpret_cast<LRESULT>(brush);
-        }
-
-        case WM_CTLCOLORBTN:
-        {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            SetTextColor(dc, C_TEXT);
-            SetBkColor(dc, C_PANEL);
-            static HBRUSH brush = CreateSolidBrush(C_PANEL);
-            return reinterpret_cast<LRESULT>(brush);
-        }
-
-        case WM_ERASEBKGND:
-        {
-            RECT rect{};
-            GetClientRect(hwnd, &rect);
-            HBRUSH brush = CreateSolidBrush(C_BG);
-            FillRect(reinterpret_cast<HDC>(wParam), &rect, brush);
-            DeleteObject(brush);
-            return 1;
-        }
-
-        case WM_TIMER:
-            if (wParam == 1) flush_pending();
-            return 0;
-
-        case WM_INTERCEPT_EVENT:
-            flush_pending();
-            return 0;
-
-        case WM_NOTIFY:
-        {
-            const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
-            if (!header) return 0;
-
-            if (header->code == TCN_SELCHANGE)
-            {
-                if (header->idFrom == IDC_TYPE_TABS) g_type_tab = TabCtrl_GetCurSel(g_type_tabs);
-                else if (header->idFrom == IDC_DIR_TABS) g_dir_tab = TabCtrl_GetCurSel(g_dir_tabs);
-                show_active_list();
-                InvalidateRect(header->hwndFrom, nullptr, TRUE);
-                return 0;
-            }
-
-            if (header->code == NM_DBLCLK)
-            {
-                const int list_id = static_cast<int>(header->idFrom);
-                if (list_id >= IDC_LIST_BASE && list_id < IDC_LIST_BASE + 4)
-                {
-                    const auto* info = reinterpret_cast<const NMITEMACTIVATE*>(lParam);
-                    if (info && info->iItem >= 0)
-                    {
-                        const int type = (list_id - IDC_LIST_BASE) / 2;
-                        const int dir = (list_id - IDC_LIST_BASE) % 2;
-                        if (static_cast<size_t>(info->iItem) < g_records[type][dir].size())
-                            open_detail(g_records[type][dir][info->iItem]);
-                    }
-                }
-                return 0;
-            }
-
-            if (header->code == NM_CUSTOMDRAW)
-            {
-                const auto* draw = reinterpret_cast<const NMLVCUSTOMDRAW*>(lParam);
-                if (header->idFrom >= IDC_LIST_BASE && header->idFrom < IDC_LIST_BASE + 4)
-                {
-                    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
-                        return CDRF_NOTIFYITEMDRAW;
-                    if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
-                    {
-                        const int list_id = static_cast<int>(header->idFrom);
-                        const int direction = (list_id - IDC_LIST_BASE) % 2;
-                        draw->clrText = direction == 0 ? C_TEXT : C_TEXT;
-                        draw->clrTextBk = C_PANEL;
-                        return CDRF_DODEFAULT;
-                    }
-                }
-            }
-
-            return 0;
-        }
-
-        case WM_COMMAND:
-        {
-            const int id = LOWORD(wParam);
-            if (id == IDC_CLEAR)
-            {
-                clear_all_lists();
-                return 0;
-            }
-            if (id == IDC_AUTOSCROLL)
-            {
-                g_auto_scroll = SendMessageA(g_autoscroll, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                return 0;
-            }
-            if (id == IDC_FILTER && HIWORD(wParam) == EN_CHANGE)
-            {
-                set_filter_text();
-                clear_all_lists();
-                return 0;
-            }
-            return 0;
-        }
-
-        case WM_SIZE:
-            resize_controls(LOWORD(lParam), HIWORD(lParam));
-            return 0;
-
-        case WM_CLOSE:
-            DestroyWindow(hwnd);
-            return 0;
-
-        case WM_DESTROY:
-            KillTimer(hwnd, 1);
-            g_hwnd = nullptr;
-            g_filter = nullptr;
-            g_autoscroll = nullptr;
-            g_type_tabs = nullptr;
-            g_dir_tabs = nullptr;
-            for (auto& type : g_lists)
-                for (HWND& list : type) list = nullptr;
-            PostQuitMessage(0);
-            return 0;
+        const int width = LOWORD(lParam);
+        const int height = HIWORD(lParam);
+        if (g_filter) MoveWindow(g_filter, 12, 12, width - 260, 30, TRUE);
+        if (g_autoscroll) MoveWindow(g_autoscroll, width - 240, 12, 120, 30, TRUE);
+        HWND clear = GetDlgItem(hwnd, IDC_CLEAR);
+        if (clear) MoveWindow(clear, width - 110, 12, 90, 30, TRUE);
+        if (g_type_tabs) MoveWindow(g_type_tabs, 12, 54, 180, 30, TRUE);
+        if (g_dir_tabs) MoveWindow(g_dir_tabs, 202, 54, 180, 30, TRUE);
+        for (auto& by_type : g_lists)
+            for (HWND list : by_type)
+                if (list) MoveWindow(list, 12, 90, width - 24, height - 102, TRUE);
+        return 0;
     }
 
+    case WM_DRAWITEM:
+        draw_tab(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+        return TRUE;
+
+    case WM_INTERCEPT_EVENT:
+        flush_pending();
+        return 0;
+
+    case WM_NOTIFY:
+    {
+        const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
+        if (!header) return 0;
+        if (header->code == TCN_SELCHANGE) {
+            if (header->idFrom == IDC_TYPE_TABS) g_type_tab = TabCtrl_GetCurSel(g_type_tabs);
+            else if (header->idFrom == IDC_DIR_TABS) g_dir_tab = TabCtrl_GetCurSel(g_dir_tabs);
+            show_active_list();
+            InvalidateRect(header->hwndFrom, nullptr, TRUE);
+            return 0;
+        }
+        if (header->code == NM_DBLCLK) {
+            const int list_id = static_cast<int>(header->idFrom);
+            if (list_id >= IDC_LIST_BASE && list_id < IDC_LIST_BASE + 4) {
+                const auto* info = reinterpret_cast<const NMITEMACTIVATE*>(lParam);
+                if (info && info->iItem >= 0) {
+                    const int type = (list_id - IDC_LIST_BASE) / 2;
+                    const int dir = (list_id - IDC_LIST_BASE) % 2;
+                    if (static_cast<size_t>(info->iItem) < g_records[type][dir].size())
+                        open_detail(g_records[type][dir][info->iItem]);
+                }
+            }
+            return 0;
+        }
+        if (header->code == NM_CUSTOMDRAW) {
+            const auto* draw = reinterpret_cast<const NMLVCUSTOMDRAW*>(lParam);
+            if (header->idFrom >= IDC_LIST_BASE && header->idFrom < IDC_LIST_BASE + 4) {
+                if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+            }
+        }
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_CLEAR) {
+            clear_all_lists();
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_AUTOSCROLL) {
+            g_auto_scroll = SendMessageA(g_autoscroll, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_FILTER) {
+            if (HIWORD(wParam) == EN_CHANGE) set_filter_text();
+            return 0;
+        }
+        return 0;
+
+    case WM_DESTROY:
+        g_running = false;
+        g_ready = false;
+        PostQuitMessage(0);
+        return 0;
+    }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
-void gui_thread_proc()
+void gui_thread_main()
 {
-    HINSTANCE instance = GetModuleHandleA(nullptr);
-
-    INITCOMMONCONTROLSEX icc{};
-    icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_WIN95_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES };
     InitCommonControlsEx(&icc);
 
-    WNDCLASSEXA wc{};
-    wc.cbSize = sizeof(wc);
+    WNDCLASSA wc{};
     wc.lpfnWndProc = wnd_proc;
-    wc.hInstance = instance;
-    wc.lpszClassName = "INTERCEPT_GUI";
-    wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = CreateSolidBrush(C_BG);
+    wc.lpszClassName = "INTERCEPT_GUI";
+    RegisterClassA(&wc);
 
-    if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-    {
-        const DWORD error = GetLastError();
-        log::error("Failed to register INTERCEPT GUI window class. error=" + std::to_string(error));
-        g_ready = true;
-        g_state_cv.notify_all();
-        return;
-    }
+    HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "INTERCEPT - Realtime Monitor",
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1040, 680,
+        nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
 
-    HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "INTERCEPT - Packet Monitor",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1200, 750,
-        nullptr, nullptr, instance, nullptr);
-    if (!hwnd)
-    {
-        const DWORD error = GetLastError();
-        log::error("Failed to create INTERCEPT GUI. error=" + std::to_string(error));
-        g_ready = true;
+    if (!hwnd) {
+        log::error("INTERCEPT GUI failed to initialize.");
+        {
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_ready = false;
+        }
         g_state_cv.notify_all();
         return;
     }
 
     g_hwnd = hwnd;
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        g_ready = true;
+    }
+    g_state_cv.notify_all();
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
-    log::info("INTERCEPT GUI started.");
-    g_ready = true;
-    g_state_cv.notify_all();
-
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_pending.empty())
-        {
-            g_event_message_pending = true;
-            PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
-        }
-    }
 
     MSG msg{};
-    while (GetMessageA(&msg, nullptr, 0, 0) > 0)
-    {
+    while (GetMessageA(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
 
-    g_running = false;
-    g_ready = false;
     g_hwnd = nullptr;
-    g_event_message_pending = false;
 }
 
 } // namespace
 
 void start()
 {
-    bool expected = false;
-    if (!g_running.compare_exchange_strong(expected, true)) return;
-
-    g_ready = false;
-    g_event_message_pending = false;
-    g_gui_thread = std::thread(gui_thread_proc);
-
+    if (g_running.exchange(true)) return;
+    g_gui_thread = std::thread(gui_thread_main);
     std::unique_lock<std::mutex> lock(g_state_mutex);
-    const bool ready = g_state_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_ready.load(); });
-    if (!ready || !g_hwnd)
-    {
-        log::error("INTERCEPT GUI failed to initialize.");
-        g_running = false;
-        if (g_gui_thread.joinable()) g_gui_thread.join();
-    }
+    g_state_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_ready.load(); });
+    if (!g_ready.load()) log::error("INTERCEPT GUI failed to initialize.");
+    else log::info("INTERCEPT GUI started.");
 }
 
 void stop()
 {
-    if (!g_running.load()) return;
-
-    HWND hwnd = g_hwnd;
-    if (hwnd) PostMessageA(hwnd, WM_CLOSE, 0, 0);
-
+    if (!g_running.exchange(false)) return;
+    if (g_hwnd) PostMessageA(g_hwnd, WM_CLOSE, 0, 0);
     if (g_gui_thread.joinable()) g_gui_thread.join();
-
-    g_running = false;
-    g_event_message_pending = false;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_pending.clear();
-    }
-
-    log::info("INTERCEPT GUI stopped.");
 }
 
 void push_event(const std::string& event)
 {
     if (!g_running.load()) return;
-
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_pending.size() >= MAX_QUEUE_SIZE)
-            g_pending.pop_front();
+        if (g_pending.size() >= MAX_QUEUE_SIZE) g_pending.pop_front();
         g_pending.push_back(event);
+        if (!g_event_message_pending.exchange(true) && g_hwnd)
+            PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
     }
-
-    HWND hwnd = g_hwnd;
-    if (!hwnd) return;
-
-    bool expected = false;
-    if (g_event_message_pending.compare_exchange_strong(expected, true))
-        PostMessageA(hwnd, WM_INTERCEPT_EVENT, 0, 0);
 }
 
 } // namespace intercept::gui
