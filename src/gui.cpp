@@ -1,236 +1,851 @@
-#include "gui.hpp"
-#include "event_queue.hpp"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 
-#include <Windows.h>
-#include <CommCtrl.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <commctrl.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cctype>
-#include <sstream>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "gui.hpp"
+#include "logger.hpp"
 
 #pragma comment(lib, "comctl32.lib")
 
+namespace intercept::gui {
+
 namespace {
-constexpr UINT IDC_FILTER = 1001;
-constexpr UINT IDC_HIDE_SYNC = 1002;
-constexpr UINT IDC_PAUSE = 1004;
-constexpr UINT IDC_TABS = 1005;
-constexpr UINT IDC_LIST = 1006;
-constexpr UINT IDC_INSPECTOR = 1007;
-constexpr UINT TIMER_ID = 1;
 
-HWND g_hwnd = nullptr, g_filter = nullptr, g_hide_sync = nullptr, g_pause = nullptr;
-HWND g_list = nullptr, g_tabs = nullptr, g_inspector = nullptr;
+constexpr int IDC_FILTER     = 1001;
+constexpr int IDC_AUTOSCROLL = 1002;
+constexpr int IDC_CLEAR      = 1003;
+constexpr int IDC_LIST       = 1004;
+
+constexpr UINT WM_INTERCEPT_EVENT = WM_APP + 1;
+
+constexpr size_t MAX_QUEUE_SIZE = 10000;
+constexpr size_t MAX_EVENTS_PER_TICK = 250;
+
+HWND g_hwnd = nullptr;
+HWND g_filter = nullptr;
+HWND g_list = nullptr;
+HWND g_autoscroll = nullptr;
+
 HFONT g_font = nullptr;
+
+std::mutex g_mutex;
+std::deque<std::string> g_pending;
+
+std::mutex g_state_mutex;
+std::condition_variable g_state_cv;
+
+std::thread g_gui_thread;
+
 std::atomic_bool g_running{false};
-std::atomic_bool g_stop{false};
-std::vector<intercept::events::Event> g_visible;
-std::vector<intercept::events::Event> g_history;
+std::atomic_bool g_ready{false};
 
-std::string lower(std::string s)
+bool g_auto_scroll = true;
+std::string g_filter_text;
+
+LRESULT CALLBACK wnd_proc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam
+);
+
+void set_filter_text()
 {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s;
+    if (!g_filter)
+        return;
+
+    char buffer[1024]{};
+
+    GetWindowTextA(
+        g_filter,
+        buffer,
+        static_cast<int>(sizeof(buffer))
+    );
+
+    g_filter_text = buffer;
+
+    std::transform(
+        g_filter_text.begin(),
+        g_filter_text.end(),
+        g_filter_text.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        }
+    );
 }
 
-bool is_sync(const intercept::events::Event& e)
+bool matches_filter(const std::string& event)
 {
-    if (e.kind != intercept::events::Kind::Packet) return false;
-    return lower(e.name).find("sync") != std::string::npos;
+    if (g_filter_text.empty())
+        return true;
+
+    std::string lower = event;
+
+    std::transform(
+        lower.begin(),
+        lower.end(),
+        lower.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        }
+    );
+
+    return lower.find(g_filter_text) != std::string::npos;
 }
 
-std::string get_filter()
+void add_column(
+    int index,
+    int width,
+    const char* text
+)
 {
-    char buf[256]{};
-    GetWindowTextA(g_filter, buf, sizeof(buf));
-    return lower(buf);
+    if (!g_list)
+        return;
+
+    LVCOLUMNA column{};
+
+    column.mask =
+        LVCF_TEXT |
+        LVCF_WIDTH |
+        LVCF_SUBITEM;
+
+    column.cx = width;
+    column.pszText = const_cast<char*>(text);
+    column.iSubItem = index;
+
+    SendMessageA(
+        g_list,
+        LVM_INSERTCOLUMNA,
+        static_cast<WPARAM>(index),
+        reinterpret_cast<LPARAM>(&column)
+    );
 }
 
-int current_tab() { return TabCtrl_GetCurSel(g_tabs); }
-
-bool matches(const intercept::events::Event& e)
+void add_columns()
 {
-    const int tab = current_tab();
-    if (tab == 1 && e.kind != intercept::events::Kind::Packet) return false;
-    if (tab == 2 && e.kind != intercept::events::Kind::Rpc) return false;
-    if (Button_GetCheck(g_hide_sync) == BST_CHECKED && is_sync(e)) return false;
-
-    const std::string f = get_filter();
-    if (f.empty()) return true;
-    std::ostringstream ss;
-    ss << e.id << ' ' << e.name << ' ' << e.details << ' ' << e.hex;
-    return lower(ss.str()).find(f) != std::string::npos;
+    add_column(0, 100, "Type");
+    add_column(1, 100, "ID");
+    add_column(2, 80, "Size");
+    add_column(3, 120, "Direction");
+    add_column(4, 700, "Data");
 }
 
-const char* kind_name(const intercept::events::Event& e)
-{ return e.kind == intercept::events::Kind::Packet ? "PACKET" : "RPC"; }
-
-const char* direction_name(const intercept::events::Event& e)
-{ return e.direction == intercept::events::Direction::Incoming ? "IN" : "OUT"; }
-
-void set_text(HWND h, const std::string& s) { SetWindowTextA(h, s.c_str()); }
-
-void refresh_list()
+void set_item_text(
+    int row,
+    int column,
+    const char* text
+)
 {
-    if (!g_list) return;
-    const auto incoming = intercept::events::drain();
-    g_history.insert(g_history.end(), incoming.begin(), incoming.end());
-    constexpr std::size_t kHistory = 20000;
-    if (g_history.size() > kHistory)
-        g_history.erase(g_history.begin(), g_history.begin() + (g_history.size() - kHistory));
+    if (!g_list)
+        return;
 
-    ListView_DeleteAllItems(g_list);
-    g_visible.clear();
+    LVITEMA item{};
 
-    for (const auto& e : g_history) {
-        if (!matches(e)) continue;
-        g_visible.push_back(e);
-        const int row = ListView_GetItemCount(g_list);
-        LVITEMA item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = row;
-        std::string seq = std::to_string(e.sequence);
-        item.pszText = seq.data();
-        ListView_InsertItemA(g_list, &item);
-        std::string values[] = {direction_name(e), kind_name(e), std::to_string(e.id), e.name,
-                                std::to_string(e.bytes), e.details};
-        for (int col = 0; col < 6; ++col)
-            ListView_SetItemTextA(g_list, row, col + 1, values[col].data());
+    item.mask = LVIF_TEXT;
+    item.iItem = row;
+    item.iSubItem = column;
+    item.pszText = const_cast<char*>(text);
+
+    SendMessageA(
+        g_list,
+        LVM_SETITEMTEXTA,
+        static_cast<WPARAM>(row),
+        reinterpret_cast<LPARAM>(&item)
+    );
+}
+
+void insert_row(
+    const char* type,
+    const char* id,
+    const char* size,
+    const char* direction,
+    const char* data
+)
+{
+    if (!g_list)
+        return;
+
+    LVITEMA item{};
+
+    item.mask = LVIF_TEXT;
+    item.iItem = 0;
+    item.iSubItem = 0;
+    item.pszText = const_cast<char*>(type);
+
+    const LRESULT row =
+        SendMessageA(
+            g_list,
+            LVM_INSERTITEMA,
+            0,
+            reinterpret_cast<LPARAM>(&item)
+        );
+
+    if (row < 0)
+        return;
+
+    set_item_text(
+        static_cast<int>(row),
+        1,
+        id
+    );
+
+    set_item_text(
+        static_cast<int>(row),
+        2,
+        size
+    );
+
+    set_item_text(
+        static_cast<int>(row),
+        3,
+        direction
+    );
+
+    set_item_text(
+        static_cast<int>(row),
+        4,
+        data
+    );
+
+    if (g_auto_scroll)
+    {
+        SendMessageA(
+            g_list,
+            LVM_ENSUREVISIBLE,
+            static_cast<WPARAM>(row),
+            TRUE
+        );
+    }
+}
+
+void parse_event(const std::string& message)
+{
+    if (!matches_filter(message))
+        return;
+
+    std::string parts[5];
+
+    size_t start = 0;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        const size_t pos =
+            message.find('|', start);
+
+        if (pos == std::string::npos)
+        {
+            parts[i] =
+                message.substr(start);
+
+            start = message.size();
+
+            break;
+        }
+
+        parts[i] =
+            message.substr(
+                start,
+                pos - start
+            );
+
+        start = pos + 1;
     }
 
-    std::ostringstream status;
-    status << "Events " << intercept::events::total_events()
-           << " | Packets " << intercept::events::total_packets()
-           << " | RPC " << intercept::events::total_rpcs()
-           << " | Queue drops " << intercept::events::dropped_events()
-           << " | Visible " << g_visible.size();
-    set_text(g_inspector, status.str());
-}
-
-void inspect_selected()
-{
-    const int row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
-    if (row < 0 || row >= static_cast<int>(g_visible.size())) return;
-    const auto& e = g_visible[row];
-    std::ostringstream ss;
-    ss << "Sequence: " << e.sequence << "\r\n"
-       << "Direction: " << direction_name(e) << "\r\n"
-       << "Type: " << kind_name(e) << "\r\n"
-       << "ID: " << e.id << "\r\n"
-       << "Name: " << e.name << "\r\n"
-       << "Bytes: " << e.bytes << "\r\n"
-       << "Details: " << e.details << "\r\n\r\n"
-       << "HEX:\r\n" << e.hex;
-    set_text(g_inspector, ss.str());
-}
-
-void layout(HWND hwnd)
-{
-    RECT r{}; GetClientRect(hwnd, &r);
-    const int w = r.right, h = r.bottom;
-    SetWindowPos(g_filter, nullptr, 10, 10, 330, 24, SWP_NOZORDER);
-    SetWindowPos(g_hide_sync, nullptr, 350, 10, 130, 24, SWP_NOZORDER);
-    SetWindowPos(g_pause, nullptr, 490, 10, 90, 24, SWP_NOZORDER);
-    SetWindowPos(g_tabs, nullptr, 10, 42, w - 20, h - 52, SWP_NOZORDER);
-    RECT tr{}; GetClientRect(g_tabs, &tr); TabCtrl_AdjustRect(g_tabs, FALSE, &tr);
-    const int x = 10 + tr.left, y = 42 + tr.top;
-    const int tw = (w - 20) - tr.left - (10 + (tr.right - tr.left));
-    const int th = (h - 52) - tr.top - (10 + (tr.bottom - tr.top));
-    const int inspector_h = 150;
-    const int list_h = std::max(100, th - inspector_h - 8);
-    SetWindowPos(g_list, nullptr, x, y, tw, list_h, SWP_NOZORDER);
-    SetWindowPos(g_inspector, nullptr, x, y + list_h + 8, tw, inspector_h, SWP_NOZORDER);
-}
-
-LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-    case WM_CREATE: {
-        g_font = CreateFontA(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, "Segoe UI");
-        HINSTANCE inst = GetModuleHandleA(nullptr);
-        g_filter = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,
-            0,0,0,0,hwnd,reinterpret_cast<HMENU>(IDC_FILTER),inst,nullptr);
-        g_hide_sync = CreateWindowA("BUTTON", "Hide Sync", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
-            0,0,0,0,hwnd,reinterpret_cast<HMENU>(IDC_HIDE_SYNC),inst,nullptr);
-        g_pause = CreateWindowA("BUTTON", "Pause", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
-            0,0,0,0,hwnd,reinterpret_cast<HMENU>(IDC_PAUSE),inst,nullptr);
-        g_tabs = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS,
-            0,0,0,0,hwnd,reinterpret_cast<HMENU>(IDC_TABS),inst,nullptr);
-        const char* names[] = {"All", "Packets", "RPC"};
-        for (int i=0;i<3;++i) { TCITEMA ti{}; ti.mask=TCIF_TEXT; ti.pszText=const_cast<char*>(names[i]); TabCtrl_InsertItem(g_tabs,i,&ti); }
-        g_list = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
-            WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS,
-            0,0,0,0,hwnd,reinterpret_cast<HMENU>(IDC_LIST),inst,nullptr);
-        const char* cols[] = {"#","Dir","Type","ID","Name","Bytes","Details"};
-        const int widths[] = {70,55,75,55,170,70,420};
-        for (int i=0;i<7;++i) { LVCOLUMNA c{}; c.mask=LVCF_TEXT|LVCF_WIDTH; c.cx=widths[i]; c.pszText=const_cast<char*>(cols[i]); ListView_InsertColumn(g_list,i,&c); }
-        g_inspector = CreateWindowExA(WS_EX_CLIENTEDGE,"EDIT","",WS_CHILD|WS_VISIBLE|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL|WS_VSCROLL,
-            0,0,0,0,hwnd,reinterpret_cast<HMENU>(IDC_INSPECTOR),inst,nullptr);
-        SendMessageA(g_filter,WM_SETFONT,reinterpret_cast<WPARAM>(g_font),TRUE);
-        SendMessageA(g_hide_sync,WM_SETFONT,reinterpret_cast<WPARAM>(g_font),TRUE);
-        SendMessageA(g_pause,WM_SETFONT,reinterpret_cast<WPARAM>(g_font),TRUE);
-        SendMessageA(g_list,WM_SETFONT,reinterpret_cast<WPARAM>(g_font),TRUE);
-        SendMessageA(g_inspector,WM_SETFONT,reinterpret_cast<WPARAM>(g_font),TRUE);
-        SetTimer(hwnd,TIMER_ID,100,nullptr);
-        layout(hwnd);
-        return 0;
+    if (start <= message.size())
+    {
+        parts[4] =
+            message.substr(start);
     }
-    case WM_SIZE: layout(hwnd); return 0;
-    case WM_TIMER: if (wp==TIMER_ID && Button_GetCheck(g_pause)!=BST_CHECKED) refresh_list(); return 0;
-    case WM_NOTIFY:
-        if (reinterpret_cast<LPNMHDR>(lp)->idFrom==IDC_LIST && reinterpret_cast<LPNMHDR>(lp)->code==LVN_ITEMCHANGED) inspect_selected();
-        else if (reinterpret_cast<LPNMHDR>(lp)->idFrom==IDC_TABS && reinterpret_cast<LPNMHDR>(lp)->code==TCN_SELCHANGE) refresh_list();
-        return 0;
-    case WM_COMMAND:
-        if (LOWORD(wp)==IDC_FILTER || LOWORD(wp)==IDC_HIDE_SYNC) refresh_list();
-        return 0;
-    case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY:
-        KillTimer(hwnd,TIMER_ID); g_running=false; g_hwnd=nullptr; PostQuitMessage(0); return 0;
-    default: return DefWindowProcA(hwnd,msg,wp,lp);
+
+    insert_row(
+        parts[0].c_str(),
+        parts[1].c_str(),
+        parts[2].c_str(),
+        parts[3].c_str(),
+        parts[4].c_str()
+    );
+}
+
+void flush_pending()
+{
+    std::vector<std::string> events;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        const size_t count =
+            std::min(
+                MAX_EVENTS_PER_TICK,
+                g_pending.size()
+            );
+
+        events.reserve(count);
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            events.emplace_back(
+                std::move(g_pending.front())
+            );
+
+            g_pending.pop_front();
+        }
+    }
+
+    for (const auto& event : events)
+    {
+        parse_event(event);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        if (!g_pending.empty() && g_hwnd)
+        {
+            PostMessageA(
+                g_hwnd,
+                WM_INTERCEPT_EVENT,
+                0,
+                0
+            );
+        }
     }
 }
 
-DWORD WINAPI gui_thread(LPVOID)
+void create_controls(HWND hwnd)
 {
-    INITCOMMONCONTROLSEX icc{sizeof(icc),ICC_TAB_CLASSES|ICC_LISTVIEW_CLASSES};
+    g_font =
+        static_cast<HFONT>(
+            GetStockObject(DEFAULT_GUI_FONT)
+        );
+
+    g_filter = CreateWindowExA(
+        WS_EX_CLIENTEDGE,
+        "EDIT",
+        "",
+        WS_CHILD |
+        WS_VISIBLE |
+        ES_AUTOHSCROLL,
+        10,
+        10,
+        300,
+        24,
+        hwnd,
+        reinterpret_cast<HMENU>(IDC_FILTER),
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    SendMessageA(
+        g_filter,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(g_font),
+        TRUE
+    );
+
+    HWND label = CreateWindowExA(
+        0,
+        "STATIC",
+        "Filter:",
+        WS_CHILD |
+        WS_VISIBLE,
+        320,
+        13,
+        50,
+        20,
+        hwnd,
+        nullptr,
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    SendMessageA(
+        label,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(g_font),
+        TRUE
+    );
+
+    g_autoscroll = CreateWindowExA(
+        0,
+        "BUTTON",
+        "Auto Scroll",
+        WS_CHILD |
+        WS_VISIBLE |
+        BS_AUTOCHECKBOX,
+        390,
+        10,
+        110,
+        24,
+        hwnd,
+        reinterpret_cast<HMENU>(IDC_AUTOSCROLL),
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    SendMessageA(
+        g_autoscroll,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(g_font),
+        TRUE
+    );
+
+    SendMessageA(
+        g_autoscroll,
+        BM_SETCHECK,
+        BST_CHECKED,
+        0
+    );
+
+    HWND clear = CreateWindowExA(
+        0,
+        "BUTTON",
+        "Clear",
+        WS_CHILD |
+        WS_VISIBLE |
+        BS_PUSHBUTTON,
+        510,
+        10,
+        80,
+        24,
+        hwnd,
+        reinterpret_cast<HMENU>(IDC_CLEAR),
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    SendMessageA(
+        clear,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(g_font),
+        TRUE
+    );
+
+    g_list = CreateWindowExA(
+        WS_EX_CLIENTEDGE,
+        WC_LISTVIEWA,
+        "",
+        WS_CHILD |
+        WS_VISIBLE |
+        LVS_REPORT |
+        LVS_SINGLESEL |
+        LVS_SHOWSELALWAYS,
+        10,
+        45,
+        1000,
+        600,
+        hwnd,
+        reinterpret_cast<HMENU>(IDC_LIST),
+        GetModuleHandleA(nullptr),
+        nullptr
+    );
+
+    SendMessageA(
+        g_list,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(g_font),
+        TRUE
+    );
+
+    SendMessageA(
+        g_list,
+        LVM_SETEXTENDEDLISTVIEWSTYLE,
+        0,
+        LVS_EX_FULLROWSELECT |
+        LVS_EX_GRIDLINES |
+        LVS_EX_DOUBLEBUFFER
+    );
+
+    add_columns();
+}
+
+LRESULT CALLBACK wnd_proc(
+    HWND hwnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam
+)
+{
+    switch (msg)
+    {
+        case WM_CREATE:
+        {
+            create_controls(hwnd);
+
+            SetTimer(
+                hwnd,
+                1,
+                50,
+                nullptr
+            );
+
+            {
+                std::lock_guard<std::mutex> lock(
+                    g_state_mutex
+                );
+
+                g_ready = true;
+            }
+
+            g_state_cv.notify_all();
+
+            return 0;
+        }
+
+        case WM_TIMER:
+        {
+            if (wParam == 1)
+            {
+                flush_pending();
+            }
+
+            return 0;
+        }
+
+        case WM_INTERCEPT_EVENT:
+        {
+            flush_pending();
+            return 0;
+        }
+
+        case WM_COMMAND:
+        {
+            const int id =
+                LOWORD(wParam);
+
+            if (id == IDC_CLEAR)
+            {
+                if (g_list)
+                {
+                    SendMessageA(
+                        g_list,
+                        LVM_DELETEALLITEMS,
+                        0,
+                        0
+                    );
+                }
+
+                return 0;
+            }
+
+            if (id == IDC_AUTOSCROLL)
+            {
+                const LRESULT state =
+                    SendMessageA(
+                        g_autoscroll,
+                        BM_GETCHECK,
+                        0,
+                        0
+                    );
+
+                g_auto_scroll =
+                    (state == BST_CHECKED);
+
+                return 0;
+            }
+
+            if (id == IDC_FILTER)
+            {
+                if (HIWORD(wParam) == EN_CHANGE)
+                {
+                    set_filter_text();
+
+                    if (g_list)
+                    {
+                        SendMessageA(
+                            g_list,
+                            LVM_DELETEALLITEMS,
+                            0,
+                            0
+                        );
+                    }
+                }
+
+                return 0;
+            }
+
+            return 0;
+        }
+
+        case WM_SIZE:
+        {
+            const int width =
+                LOWORD(lParam);
+
+            const int height =
+                HIWORD(lParam);
+
+            if (g_list)
+            {
+                MoveWindow(
+                    g_list,
+                    10,
+                    45,
+                    std::max(100, width - 20),
+                    std::max(100, height - 55),
+                    TRUE
+                );
+            }
+
+            return 0;
+        }
+
+        case WM_CLOSE:
+        {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+
+        case WM_DESTROY:
+        {
+            KillTimer(hwnd, 1);
+
+            g_hwnd = nullptr;
+            g_filter = nullptr;
+            g_list = nullptr;
+            g_autoscroll = nullptr;
+
+            PostQuitMessage(0);
+
+            return 0;
+        }
+    }
+
+    return DefWindowProcA(
+        hwnd,
+        msg,
+        wParam,
+        lParam
+    );
+}
+
+void gui_thread_proc()
+{
+    HINSTANCE instance =
+        GetModuleHandleA(nullptr);
+
+    INITCOMMONCONTROLSEX icc{};
+
+    icc.dwSize = sizeof(icc);
+
+    icc.dwICC =
+        ICC_LISTVIEW_CLASSES |
+        ICC_STANDARD_CLASSES;
+
     InitCommonControlsEx(&icc);
-    WNDCLASSA wc{}; wc.lpfnWndProc=wndproc; wc.hInstance=GetModuleHandleA(nullptr); wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
-    wc.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1); wc.lpszClassName="INTERCEPT_GUI_V02";
-    RegisterClassA(&wc);
-    g_hwnd=CreateWindowExA(0,wc.lpszClassName,"INTERCEPT v0.2 - Realtime Monitor",WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,CW_USEDEFAULT,1100,700,nullptr,nullptr,wc.hInstance,nullptr);
-    if (!g_hwnd) { g_running=false; return 0; }
-    ShowWindow(g_hwnd,SW_SHOW); UpdateWindow(g_hwnd); g_running=true;
-    MSG msg{}; while (!g_stop && GetMessageA(&msg,nullptr,0,0)>0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
-    return 0;
+
+    WNDCLASSEXA wc{};
+
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = instance;
+    wc.lpszClassName = "INTERCEPT_GUI";
+    wc.hCursor =
+        LoadCursorA(
+            nullptr,
+            IDC_ARROW
+        );
+
+    wc.hbrBackground =
+        reinterpret_cast<HBRUSH>(
+            COLOR_WINDOW + 1
+        );
+
+    RegisterClassExA(&wc);
+
+    HWND hwnd = CreateWindowExA(
+        0,
+        wc.lpszClassName,
+        "INTERCEPT - Packet Monitor",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        1100,
+        700,
+        nullptr,
+        nullptr,
+        instance,
+        nullptr
+    );
+
+    if (!hwnd)
+    {
+        log::error(
+            "Failed to create INTERCEPT GUI."
+        );
+
+        {
+            std::lock_guard<std::mutex> lock(
+                g_state_mutex
+            );
+
+            g_ready = true;
+        }
+
+        g_state_cv.notify_all();
+
+        return;
+    }
+
+    g_hwnd = hwnd;
+
+    ShowWindow(
+        hwnd,
+        SW_SHOW
+    );
+
+    UpdateWindow(hwnd);
+
+    log::info(
+        "INTERCEPT GUI started."
+    );
+
+    MSG msg{};
+
+    while (GetMessageA(
+        &msg,
+        nullptr,
+        0,
+        0
+    ) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    g_running = false;
+    g_ready = false;
+    g_hwnd = nullptr;
 }
 
-HANDLE g_thread=nullptr;
 } // namespace
 
-namespace intercept::gui {
 void start()
 {
-    if (g_running || g_thread) return;
-    g_stop=false;
-    g_thread=CreateThread(nullptr,0,gui_thread,nullptr,0,nullptr);
-}
-void stop()
-{
-    g_stop=true;
-    if (g_hwnd) PostMessageA(g_hwnd,WM_CLOSE,0,0);
-    if (g_thread) {
-        WaitForSingleObject(g_thread,2000);
-        CloseHandle(g_thread);
-        g_thread=nullptr;
+    bool expected = false;
+
+    if (!g_running.compare_exchange_strong(
+        expected,
+        true))
+    {
+        return;
+    }
+
+    g_ready = false;
+
+    g_gui_thread =
+        std::thread(gui_thread_proc);
+
+    std::unique_lock<std::mutex> lock(
+        g_state_mutex
+    );
+
+    g_state_cv.wait_for(
+        lock,
+        std::chrono::seconds(5),
+        [] {
+            return g_ready.load();
+        }
+    );
+
+    if (!g_hwnd)
+    {
+        log::error(
+            "INTERCEPT GUI failed to initialize."
+        );
+
+        g_running = false;
+
+        if (g_gui_thread.joinable())
+        {
+            g_gui_thread.join();
+        }
     }
 }
+
+void stop()
+{
+    if (!g_running.load())
+        return;
+
+    HWND hwnd = g_hwnd;
+
+    if (hwnd)
+    {
+        PostMessageA(
+            hwnd,
+            WM_CLOSE,
+            0,
+            0
+        );
+    }
+
+    if (g_gui_thread.joinable())
+    {
+        g_gui_thread.join();
+    }
+
+    g_running = false;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_mutex
+        );
+
+        g_pending.clear();
+    }
+
+    log::info(
+        "INTERCEPT GUI stopped."
+    );
+}
+
+void push_event(const std::string& event)
+{
+    if (!g_running.load())
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_mutex
+        );
+
+        if (g_pending.size() >= MAX_QUEUE_SIZE)
+        {
+            g_pending.pop_front();
+        }
+
+        g_pending.push_back(event);
+    }
+
+    HWND hwnd = g_hwnd;
+
+    if (hwnd)
+    {
+        PostMessageA(
+            hwnd,
+            WM_INTERCEPT_EVENT,
+            0,
+            0
+        );
+    }
+}
+
 } // namespace intercept::gui

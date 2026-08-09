@@ -1,6 +1,12 @@
 #pragma once
 
+#include <string>
+
 namespace intercept::gui {
+
 void start();
 void stop();
-} // namespace intercept::gui
+
+void push_event(const std::string& event);
+
+}
