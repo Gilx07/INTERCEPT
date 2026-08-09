@@ -5,11 +5,13 @@
 #include "logger.hpp"
 
 #include <RakHook/rakhook.hpp>
+#include <RakNet/BitStream.h>
 
 #include <atomic>
 #include <cstddef>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 std::atomic_bool g_installed{false};
@@ -120,6 +122,39 @@ void push_rpc(intercept::events::Direction direction, unsigned char id, RakNet::
     intercept::events::push(std::move(e));
 }
 
+bool parse_hex(const std::string& input, std::vector<unsigned char>& out)
+{
+    auto value = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+
+    out.clear();
+    int high = -1;
+
+    for (char c : input)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+            continue;
+
+        const int nibble = value(c);
+        if (nibble < 0)
+            return false;
+
+        if (high < 0)
+            high = nibble;
+        else
+        {
+            out.push_back(static_cast<unsigned char>((high << 4) | nibble));
+            high = -1;
+        }
+    }
+
+    return high < 0 && !out.empty();
+}
+
 void register_callbacks()
 {
     intercept::log::info("[HOOK] Registering on_send_packet callback.");
@@ -168,6 +203,53 @@ void install()
 void uninstall()
 {
     g_installed = false;
+}
+
+bool send_packet_hex(const std::string& hex)
+{
+    std::vector<unsigned char> bytes;
+    if (!parse_hex(hex, bytes))
+    {
+        log::error("GUI send packet rejected: invalid HEX.");
+        return false;
+    }
+
+    RakNet::BitStream bs(bytes.data(), static_cast<unsigned int>(bytes.size()), false);
+    const bool ok = rakhook::send(
+        &bs,
+        HIGH_PRIORITY,
+        RELIABLE_ORDERED,
+        0
+    );
+
+    log::info(std::string("GUI send packet: ") + (ok ? "success" : "failed"));
+    return ok;
+}
+
+bool send_rpc_hex(int id, const std::string& hex)
+{
+    if (id < 0 || id > 255)
+        return false;
+
+    std::vector<unsigned char> bytes;
+    if (!parse_hex(hex, bytes))
+    {
+        log::error("GUI send RPC rejected: invalid HEX.");
+        return false;
+    }
+
+    RakNet::BitStream bs(bytes.data(), static_cast<unsigned int>(bytes.size()), false);
+    const bool ok = rakhook::send_rpc(
+        id,
+        &bs,
+        HIGH_PRIORITY,
+        RELIABLE_ORDERED,
+        0,
+        false
+    );
+
+    log::info(std::string("GUI send RPC: ") + (ok ? "success" : "failed"));
+    return ok;
 }
 
 } // namespace intercept::monitor
