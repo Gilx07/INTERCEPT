@@ -3,6 +3,7 @@
 #include "event_queue.hpp"
 #include "gui.hpp"
 #include "logger.hpp"
+#include "session.hpp"
 
 #include <RakHook/rakhook.hpp>
 #include <RakNet/BitStream.h>
@@ -83,6 +84,7 @@ void push_packet(intercept::events::Direction direction, RakNet::BitStream* bs)
     e.id = (data && e.bytes) ? static_cast<unsigned char>(data[0]) : -1;
     e.hex = packet_hex(bs);
 
+    intercept::session::record(e);
     publish_gui(e);
     intercept::events::push(std::move(e));
 }
@@ -101,6 +103,7 @@ void push_packet(intercept::events::Direction direction, Packet* packet)
     e.id = (data && e.bytes) ? data[0] : -1;
     e.hex = packet_hex(packet);
 
+    intercept::session::record(e);
     publish_gui(e);
     intercept::events::push(std::move(e));
 }
@@ -118,6 +121,7 @@ void push_rpc(intercept::events::Direction direction, unsigned char id, RakNet::
     e.details = decoded.details;
     e.hex = packet_hex(bs);
 
+    intercept::session::record(e);
     publish_gui(e);
     intercept::events::push(std::move(e));
 }
@@ -190,11 +194,13 @@ void install()
 {
     if (g_installed.exchange(true)) return;
     register_callbacks();
+    intercept::session::start();
     log::info("INTERCEPT monitor callbacks registered.");
 }
 
 void uninstall()
 {
+    intercept::session::stop();
     g_installed = false;
 }
 

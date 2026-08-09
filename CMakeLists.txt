@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(INTERCEPT VERSION 0.2 LANGUAGES CXX)
+project(INTERCEPT VERSION 0.2.1 LANGUAGES CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "INTERCEPT currently targets Windows only.")
@@ -31,6 +31,7 @@ add_library(INTERCEPT SHARED
     src/decoder.cpp
     src/console.cpp
     src/event_queue.cpp
+    src/session.cpp
     src/gui.cpp
 )
 
