@@ -15,7 +15,6 @@
 #include <cctype>
 #include <cstring>
 #include <deque>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -41,9 +40,9 @@ constexpr int IDC_DETAIL_COPY = 2002;
 constexpr int IDC_DETAIL_SEND = 2003;
 constexpr int IDC_DETAIL_CLOSE = 2004;
 constexpr UINT WM_INTERCEPT_EVENT = WM_APP + 1;
-constexpr size_t MAX_QUEUE_SIZE = 10000;
-constexpr size_t MAX_EVENTS_PER_TICK = 250;
-constexpr size_t MAX_ROWS_PER_LIST = 10000;
+constexpr size_t MAX_QUEUE_SIZE = 20000;
+constexpr size_t MAX_EVENTS_PER_TICK = 100;
+constexpr size_t MAX_ROWS_PER_LIST = 5000;
 
 enum class EventType { Packet, Rpc };
 enum class Direction { Incoming, Outgoing };
@@ -78,6 +77,7 @@ std::condition_variable g_state_cv;
 std::thread g_gui_thread;
 std::atomic_bool g_running{false};
 std::atomic_bool g_ready{false};
+std::atomic_bool g_event_message_pending{false};
 
 bool g_auto_scroll = true;
 std::string g_filter_text;
@@ -160,8 +160,7 @@ void insert_row(const EventRecord& event)
     if (records.size() > MAX_ROWS_PER_LIST)
     {
         records.pop_front();
-        const int count = static_cast<int>(SendMessageA(list, LVM_GETITEMCOUNT, 0, 0));
-        if (count > 0) SendMessageA(list, LVM_DELETEITEM, 0, 0);
+        SendMessageA(list, LVM_DELETEITEM, 0, 0);
     }
 
     const int row_index = static_cast<int>(records.size()) - 1;
@@ -186,9 +185,6 @@ void insert_row(const EventRecord& event)
         display += event.hex;
     }
     set_item_text(list, row_index, 3, display.c_str());
-
-    if (g_auto_scroll && list == current_list())
-        SendMessageA(list, LVM_ENSUREVISIBLE, static_cast<WPARAM>(row_index), TRUE);
 }
 
 EventRecord parse_event(const std::string& message, bool* accepted = nullptr)
@@ -241,8 +237,7 @@ EventRecord parse_event(const std::string& message, bool* accepted = nullptr)
     if (hex_pos != std::string::npos)
     {
         event.hex = detail.substr(hex_pos + hex_tag.size());
-        if (hex_pos > 0 && detail[hex_pos - 1] == '|') detail.erase(hex_pos - 1);
-        else detail.erase(hex_pos);
+        detail.erase(hex_pos);
         while (!detail.empty() && (detail.back() == ' ' || detail.back() == '|')) detail.pop_back();
     }
     event.data = detail;
@@ -262,6 +257,8 @@ void clear_all_lists()
 
 void flush_pending()
 {
+    g_event_message_pending = false;
+
     std::vector<std::string> events;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -274,6 +271,10 @@ void flush_pending()
         }
     }
 
+    for (int type = 0; type < 2; ++type)
+        for (int dir = 0; dir < 2; ++dir)
+            if (g_lists[type][dir]) SendMessageA(g_lists[type][dir], WM_SETREDRAW, FALSE, 0);
+
     for (const auto& raw : events)
     {
         bool accepted = false;
@@ -281,13 +282,39 @@ void flush_pending()
         if (accepted) insert_row(event);
     }
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_pending.empty() && g_hwnd) PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
+    for (int type = 0; type < 2; ++type)
+        for (int dir = 0; dir < 2; ++dir)
+            if (g_lists[type][dir])
+            {
+                SendMessageA(g_lists[type][dir], WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(g_lists[type][dir], nullptr, FALSE);
+            }
+
+    HWND list = current_list();
+    if (g_auto_scroll && list)
+    {
+        const int count = static_cast<int>(SendMessageA(list, LVM_GETITEMCOUNT, 0, 0));
+        if (count > 0)
+            SendMessageA(list, LVM_ENSUREVISIBLE, static_cast<WPARAM>(count - 1), TRUE);
+    }
+
+    bool more = false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        more = !g_pending.empty();
+    }
+
+    if (more)
+    {
+        bool expected = false;
+        if (g_event_message_pending.compare_exchange_strong(expected, true) && g_hwnd)
+            PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
+    }
 }
 
 void set_clipboard_text(const std::string& text)
 {
-    if (!OpenClipboard(g_hwnd)) return;
+    if (!g_hwnd || !OpenClipboard(g_hwnd)) return;
     EmptyClipboard();
     HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
     if (!memory) { CloseClipboard(); return; }
@@ -304,11 +331,9 @@ void send_detail(HWND hwnd, DetailState* state)
     char buffer[65536]{};
     GetWindowTextA(state->hex, buffer, static_cast<int>(sizeof(buffer)));
     const std::string hex = buffer;
-    bool ok = false;
-    if (state->event.type == EventType::Packet)
-        ok = monitor::send_packet_hex(hex);
-    else
-        ok = monitor::send_rpc_hex(state->event.id, hex);
+    bool ok = state->event.type == EventType::Packet
+        ? monitor::send_packet_hex(hex)
+        : monitor::send_rpc_hex(state->event.id, hex);
 
     MessageBoxA(hwnd, ok ? "Send successful." : "Send failed. Check HEX and packet/RPC state.",
         "INTERCEPT", ok ? MB_OK | MB_ICONINFORMATION : MB_OK | MB_ICONERROR);
@@ -366,8 +391,8 @@ LRESULT CALLBACK detail_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         case WM_COMMAND:
         {
-            const int id = LOWORD(wParam);
             if (!state) return 0;
+            const int id = LOWORD(wParam);
             if (id == IDC_DETAIL_COPY)
             {
                 char buffer[65536]{};
@@ -431,20 +456,25 @@ void open_detail(const EventRecord& event)
 void create_tabs(HWND hwnd)
 {
     g_type_tabs = CreateWindowExA(0, WC_TABCONTROLA, "",
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED,
         10, 42, 250, 32, hwnd, reinterpret_cast<HMENU>(IDC_TYPE_TABS), GetModuleHandleA(nullptr), nullptr);
+    g_dir_tabs = CreateWindowExA(0, WC_TABCONTROLA, "",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED,
+        270, 42, 250, 32, hwnd, reinterpret_cast<HMENU>(IDC_DIR_TABS), GetModuleHandleA(nullptr), nullptr);
+
     SendMessageA(g_type_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+    SendMessageA(g_dir_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
+
     TCITEMA item{};
     item.mask = TCIF_TEXT;
-    item.pszText = const_cast<char*>("Packet"); TabCtrl_InsertItem(g_type_tabs, 0, &item);
-    item.pszText = const_cast<char*>("RPC"); TabCtrl_InsertItem(g_type_tabs, 1, &item);
-
-    g_dir_tabs = CreateWindowExA(0, WC_TABCONTROLA, "",
-        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-        270, 42, 250, 32, hwnd, reinterpret_cast<HMENU>(IDC_DIR_TABS), GetModuleHandleA(nullptr), nullptr);
-    SendMessageA(g_dir_tabs, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
-    item.pszText = const_cast<char*>("IN"); TabCtrl_InsertItem(g_dir_tabs, 0, &item);
-    item.pszText = const_cast<char*>("OUT"); TabCtrl_InsertItem(g_dir_tabs, 1, &item);
+    item.pszText = const_cast<char*>("Packet");
+    TabCtrl_InsertItem(g_type_tabs, 0, &item);
+    item.pszText = const_cast<char*>("RPC");
+    TabCtrl_InsertItem(g_type_tabs, 1, &item);
+    item.pszText = const_cast<char*>("IN");
+    TabCtrl_InsertItem(g_dir_tabs, 0, &item);
+    item.pszText = const_cast<char*>("OUT");
+    TabCtrl_InsertItem(g_dir_tabs, 1, &item);
 }
 
 HWND create_list(HWND hwnd, int type, int direction)
@@ -464,6 +494,7 @@ HWND create_list(HWND hwnd, int type, int direction)
 void create_controls(HWND hwnd)
 {
     g_font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+
     g_filter = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
         10, 10, 300, 24, hwnd, reinterpret_cast<HMENU>(IDC_FILTER), GetModuleHandleA(nullptr), nullptr);
     SendMessageA(g_filter, WM_SETFONT, reinterpret_cast<WPARAM>(g_font), TRUE);
@@ -497,22 +528,30 @@ void resize_controls(int width, int height)
             if (list) MoveWindow(list, 10, 78, std::max(100, width - 20), std::max(100, height - 88), TRUE);
 }
 
-LRESULT custom_tab_draw(const NMHDR* header)
+void draw_owner_tab(const DRAWITEMSTRUCT* dis)
 {
-    const auto* draw = reinterpret_cast<const NMCUSTOMDRAW*>(header);
-    if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
-    if (draw->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+    if (!dis || dis->CtlType != ODT_TAB) return;
+
+    const int tab_index = static_cast<int>(dis->itemID);
+    const bool type_tab = dis->CtlID == IDC_TYPE_TABS;
+    const bool selected = (type_tab ? g_type_tab : g_dir_tab) == tab_index;
 
     COLORREF color;
-    if (header->idFrom == IDC_TYPE_TABS)
-        color = draw->dwItemSpec == 0 ? RGB(70, 130, 220) : RGB(135, 85, 190);
+    if (type_tab)
+        color = tab_index == 0 ? RGB(55, 125, 220) : RGB(135, 75, 190);
     else
-        color = draw->dwItemSpec == 0 ? RGB(55, 160, 95) : RGB(210, 75, 75);
+        color = tab_index == 0 ? RGB(45, 160, 90) : RGB(205, 65, 65);
 
-    HDC dc = draw->hdc;
-    RECT rect = draw->rc;
+    if (!selected)
+    {
+        color = RGB(
+            (GetRValue(color) + 210) / 2,
+            (GetGValue(color) + 210) / 2,
+            (GetBValue(color) + 210) / 2);
+    }
+
     HBRUSH brush = CreateSolidBrush(color);
-    FillRect(dc, &rect, brush);
+    FillRect(dis->hDC, &dis->rcItem, brush);
     DeleteObject(brush);
 
     char text[128]{};
@@ -520,12 +559,11 @@ LRESULT custom_tab_draw(const NMHDR* header)
     item.mask = TCIF_TEXT;
     item.pszText = text;
     item.cchTextMax = static_cast<int>(sizeof(text));
-    TabCtrl_GetItem(reinterpret_cast<HWND>(header->hwndFrom), static_cast<int>(draw->dwItemSpec), &item);
+    TabCtrl_GetItem(dis->hwndItem, tab_index, &item);
 
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    DrawTextA(dc, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    return CDRF_SKIPDEFAULT;
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, RGB(255, 255, 255));
+    DrawTextA(dis->hDC, text, -1, const_cast<RECT*>(&dis->rcItem), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -536,33 +574,40 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             create_controls(hwnd);
             SetTimer(hwnd, 1, 50, nullptr);
             return 0;
+
+        case WM_DRAWITEM:
+            draw_owner_tab(reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
+            return TRUE;
+
         case WM_TIMER:
             if (wParam == 1) flush_pending();
             return 0;
+
         case WM_INTERCEPT_EVENT:
             flush_pending();
             return 0;
+
         case WM_NOTIFY:
         {
             const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
             if (!header) return 0;
-            if (header->code == NM_CUSTOMDRAW &&
-                (header->idFrom == IDC_TYPE_TABS || header->idFrom == IDC_DIR_TABS))
-                return custom_tab_draw(header);
+
             if (header->code == TCN_SELCHANGE)
             {
                 if (header->idFrom == IDC_TYPE_TABS) g_type_tab = TabCtrl_GetCurSel(g_type_tabs);
                 else if (header->idFrom == IDC_DIR_TABS) g_dir_tab = TabCtrl_GetCurSel(g_dir_tabs);
                 show_active_list();
+                InvalidateRect(header->hwndFrom, nullptr, TRUE);
                 return 0;
             }
+
             if (header->code == NM_DBLCLK)
             {
                 const int list_id = static_cast<int>(header->idFrom);
                 if (list_id >= IDC_LIST_BASE && list_id < IDC_LIST_BASE + 4)
                 {
                     const auto* info = reinterpret_cast<const NMITEMACTIVATE*>(lParam);
-                    if (info->iItem >= 0)
+                    if (info && info->iItem >= 0)
                     {
                         const int type = (list_id - IDC_LIST_BASE) / 2;
                         const int dir = (list_id - IDC_LIST_BASE) % 2;
@@ -574,10 +619,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
         }
+
         case WM_COMMAND:
         {
             const int id = LOWORD(wParam);
-            if (id == IDC_CLEAR) { clear_all_lists(); return 0; }
+            if (id == IDC_CLEAR)
+            {
+                clear_all_lists();
+                return 0;
+            }
             if (id == IDC_AUTOSCROLL)
             {
                 g_auto_scroll = SendMessageA(g_autoscroll, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -591,12 +641,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
         }
+
         case WM_SIZE:
             resize_controls(LOWORD(lParam), HIWORD(lParam));
             return 0;
+
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
+
         case WM_DESTROY:
             KillTimer(hwnd, 1);
             g_hwnd = nullptr;
@@ -609,12 +662,14 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PostQuitMessage(0);
             return 0;
     }
+
     return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 
 void gui_thread_proc()
 {
     HINSTANCE instance = GetModuleHandleA(nullptr);
+
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_STANDARD_CLASSES;
@@ -658,7 +713,11 @@ void gui_thread_proc()
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_pending.empty()) PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
+        if (!g_pending.empty())
+        {
+            g_event_message_pending = true;
+            PostMessageA(g_hwnd, WM_INTERCEPT_EVENT, 0, 0);
+        }
     }
 
     MSG msg{};
@@ -667,9 +726,11 @@ void gui_thread_proc()
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+
     g_running = false;
     g_ready = false;
     g_hwnd = nullptr;
+    g_event_message_pending = false;
 }
 
 } // namespace
@@ -678,8 +739,11 @@ void start()
 {
     bool expected = false;
     if (!g_running.compare_exchange_strong(expected, true)) return;
+
     g_ready = false;
+    g_event_message_pending = false;
     g_gui_thread = std::thread(gui_thread_proc);
+
     std::unique_lock<std::mutex> lock(g_state_mutex);
     const bool ready = g_state_cv.wait_for(lock, std::chrono::seconds(5), [] { return g_ready.load(); });
     if (!ready || !g_hwnd)
@@ -693,27 +757,39 @@ void start()
 void stop()
 {
     if (!g_running.load()) return;
+
     HWND hwnd = g_hwnd;
     if (hwnd) PostMessageA(hwnd, WM_CLOSE, 0, 0);
+
     if (g_gui_thread.joinable()) g_gui_thread.join();
+
     g_running = false;
+    g_event_message_pending = false;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_pending.clear();
     }
+
     log::info("INTERCEPT GUI stopped.");
 }
 
 void push_event(const std::string& event)
 {
     if (!g_running.load()) return;
+
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_pending.size() >= MAX_QUEUE_SIZE) g_pending.pop_front();
+        if (g_pending.size() >= MAX_QUEUE_SIZE)
+            g_pending.pop_front();
         g_pending.push_back(event);
     }
+
     HWND hwnd = g_hwnd;
-    if (hwnd) PostMessageA(hwnd, WM_INTERCEPT_EVENT, 0, 0);
+    if (!hwnd) return;
+
+    bool expected = false;
+    if (g_event_message_pending.compare_exchange_strong(expected, true))
+        PostMessageA(hwnd, WM_INTERCEPT_EVENT, 0, 0);
 }
 
 } // namespace intercept::gui
