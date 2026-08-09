@@ -1,68 +1,71 @@
-# INTERCEPT v0.1
+# INTERCEPT v0.2
 
-Passive SA-MP RakNet packet/RPC monitor.
+Realtime SA-MP RakNet packet/RPC monitor for the user's tested client target.
 
 ## Target
 
 - Windows
 - GTA San Andreas 1.0 US
 - SA-MP 0.3.DL-R1
-- 32-bit x86 build
+- 32-bit x86
+- RakHook pinned to `109daae3031cd030d272fa35407412443f03dede`
 
-## What v0.1 does
+## Current status
 
-It does **not** modify, block, replay, or send traffic.
+### Implemented
 
-It only observes:
+- RakHook packet/RPC observation
+- Incoming/outgoing event capture
+- Thread-safe bounded event queue
+- Native Win32 realtime GUI
+- `All`, `Packets`, and `RPC` tabs
+- Text filtering across ID/name/details/HEX
+- `Hide Sync` filter for high-frequency sync traffic
+- Pause display updates
+- Event counters and queue-drop counter
+- Per-event inspector with raw hexadecimal payload
+- Bounded in-memory history (20,000 displayed events)
+- Reduced `INTERCEPT.log` noise: packet/RPC traffic is routed to the realtime event queue instead of logging every event
 
-- outgoing packets
-- incoming packets
-- outgoing RPC
-- incoming RPC
+### Decoder status
 
-Each event is written to `INTERCEPT.log` next to the loaded game executable/module location.
+The decoder layer currently provides conservative packet/RPC naming and metadata.
+It should not be treated as a complete SA-MP protocol schema yet. Field-level
+layouts will be added only after they are verified against the exact 0.3.DL-R1
+traffic and RakHook interfaces used by this project.
 
-The log includes:
+## GUI
 
-- direction
-- packet/RPC type
-- ID where available
-- payload byte count
-- payload bit count for BitStream events
-- RakNet priority
-- reliability
-- ordering channel
-- timestamp flag for outgoing RPC
-- a bounded hexadecimal payload dump (up to 256 bytes)
+The GUI is intentionally native Win32 for the first realtime-monitor milestone.
+It is created only after RakHook initializes successfully.
 
-## Why RakHook
+The main view contains:
 
-This project deliberately uses RakHook instead of hooking `WSASend`/`WSARecv`.
+```text
++---------------------------------------------------------------+
+| Filter                         [Hide Sync] [Pause]             |
++---------------------------------------------------------------+
+| [All] [Packets] [RPC]                                         |
+|                                                               |
+| #    Dir  Type    ID   Name          Bytes  Details           |
+| ...                                                           |
+|                                                               |
++---------------------------------------------------------------+
+| Selected event / status / raw HEX                             |
++---------------------------------------------------------------+
+```
 
-RakHook exposes client-side SA-MP events at the RakNet layer and explicitly lists
-SA-MP 0.3DL-R1 as a supported version.
-
-Pinned revision:
-
-`109daae3031cd030d272fa35407412443f03dede`
+The GUI is a monitor/inspection surface. It does not currently modify, block,
+replay, or transmit captured traffic.
 
 ## Build
 
-Install:
-
-- Visual Studio 2022 with Desktop development with C++
-- CMake 3.20+
-- Git
-
-Generate a 32-bit Visual Studio build:
+Use a 32-bit Visual Studio generator because SA-MP/RakHook is x86:
 
 ```bat
 cmake -S . -B build -A Win32
 cmake --build build --config Release
 ```
-
-The first configure requires internet access because CMake fetches RakHook and
-its Cyanide dependency.
 
 Output:
 
@@ -73,28 +76,62 @@ build\Release\INTERCEPT.dll
 ## Loading
 
 Load `INTERCEPT.dll` into the GTA SA process after `samp.dll` is available.
+This repository intentionally does not include an injector.
 
-This project intentionally does not include an injector.
-
-## Expected log
-
-Example:
+## Runtime flow
 
 ```text
-[12:34:56.123] [INFO] samp.dll detected.
-[12:34:56.400] [INFO] RakHook initialized. attempt=2 samp_version=...
-[12:34:57.010] [INFO] OUT PACKET id=... bytes=...
-[12:34:57.020] [INFO] OUT RPC id=... bytes=...
-[12:34:57.100] [INFO] IN PACKET id=... bytes=...
-[12:34:57.150] [INFO] IN RPC id=... bytes=...
+RakHook callback
+      |
+      v
+bounded event queue
+      |
+      +----> realtime GUI
+      |
+      +----> counters
 ```
 
-## Important limitation of v0.1
+The queue is capped at 4096 pending events. If the GUI cannot consume events
+fast enough, old pending events are discarded and the `Queue drops` counter
+records the loss. This prevents high-frequency synchronization traffic from
+causing unbounded memory growth.
 
-The first version is intentionally a monitor, not a packet editor/repeater.
+The GUI keeps up to 20,000 consumed events for inspection. Filters affect only
+display; they do not change the underlying counters.
 
-Also, the packet event itself is a RakNet-level event. The first milestone is
-to verify that the hook works reliably on the user's exact 0.3.DL-R1 client.
+## Logging
 
-After that, the next layer should add packet/RPC name resolution and structured
-BitStream decoders.
+`INTERCEPT.log` is now intended primarily for lifecycle and diagnostic messages:
+
+```text
+[INFO] INTERCEPT v0.2 starting
+[INFO] samp.dll detected.
+[INFO] INTERCEPT monitor callbacks registered.
+[INFO] RakHook initialized. attempt=1 samp_version=3
+[INFO] Realtime monitor is active.
+```
+
+High-frequency packet/RPC payloads should be inspected through the GUI instead
+of the text log.
+
+## Safety / scope
+
+This milestone is deliberately passive. The packet editor/repeater idea is not
+implemented in v0.2. The immediate objective is reliable capture, filtering,
+inspection, and protocol identification before adding any more invasive
+functionality.
+
+## Development roadmap
+
+- [x] Passive RakHook capture
+- [x] Realtime event queue
+- [x] Packet/RPC GUI separation
+- [x] Sync filtering
+- [x] Raw payload inspector
+- [ ] Verified field-level SA-MP decoders
+- [ ] Better event classification and search
+- [ ] Dashboard/rate graphs
+- [ ] Persistent capture/export format
+
+README status is updated as milestones actually land in the source tree; planned
+features are kept separate from implemented features.
